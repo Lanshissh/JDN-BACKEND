@@ -349,6 +349,109 @@ async function computeBillingForTenant({ tenantId, endDate, penaltyRatePct = 0, 
   return { meters: results, totals_by_type, grand_totals };
 }
 
+/**
+ * computeBillingForBuilding
+ * @param {object} opts
+ *  - buildingId: string | number
+ *  - endDate: YYYY-MM-DD
+ *  - penaltyRatePct?: number (percent)
+ *  - restrictToBuildingIds?: string[] | null
+ */
+async function computeBillingForBuilding({ buildingId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null }) {
+  const bid = String(buildingId);
+
+  // Scope (provided by middlewares via req.restrictToBuildingIds)
+  if (Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length) {
+    if (!restrictToBuildingIds.includes(bid)) {
+      const e = new Error('No access to this building');
+      e.status = 403;
+      throw e;
+    }
+  }
+
+  // All stalls in the building
+  const stalls = await Stall.findAll({
+    where: { building_id: bid },
+    attributes: ['stall_id'],
+    raw: true,
+  });
+  if (!stalls.length) {
+    const e = new Error('No stalls found for this building');
+    e.status = 404;
+    throw e;
+  }
+
+  // All meters attached to those stalls
+  const stallIds = stalls.map(s => s.stall_id);
+  const meters = await Meter.findAll({
+    where: { stall_id: { [Op.in]: stallIds } },
+    attributes: ['meter_id'],
+    raw: true,
+  });
+  if (!meters.length) {
+    const e = new Error('No meters found for this building');
+    e.status = 404;
+    throw e;
+  }
+
+  // Compute per-meter bills
+  const results = [];
+  for (const m of meters) {
+    try {
+      const r = await computeBillingForMeter({
+        meterId: m.meter_id,
+        endDate,
+        penaltyRatePct,
+        restrictToBuildingIds, // still pass scope to the inner call
+      });
+      results.push(r);
+    } catch (innerErr) {
+      results.push({ meter_id: m.meter_id, error: innerErr.message || 'Billing failed for this meter' });
+    }
+  }
+
+  // Aggregate
+  const totals_by_type = {};
+  let grand_totals = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
+
+  for (const r of results) {
+    if (r?.error) continue;
+    const t = r.meter.meter_type;
+    const b = r.totals;
+
+    if (!totals_by_type[t]) totals_by_type[t] = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
+
+    totals_by_type[t].base    += b.base;
+    totals_by_type[t].vat     += b.vat;
+    totals_by_type[t].wt      += b.wt;
+    totals_by_type[t].penalty += b.penalty;
+    totals_by_type[t].total   += b.total;
+
+    grand_totals.base    += b.base;
+    grand_totals.vat     += b.vat;
+    grand_totals.wt      += b.wt;
+    grand_totals.penalty += b.penalty;
+    grand_totals.total   += b.total;
+  }
+
+  // Round
+  Object.keys(totals_by_type).forEach(k => {
+    totals_by_type[k].base    = round(totals_by_type[k].base);
+    totals_by_type[k].vat     = round(totals_by_type[k].vat);
+    totals_by_type[k].wt      = round(totals_by_type[k].wt);
+    totals_by_type[k].penalty = round(totals_by_type[k].penalty);
+    totals_by_type[k].total   = round(totals_by_type[k].total);
+  });
+
+  grand_totals.base    = round(grand_totals.base);
+  grand_totals.vat     = round(grand_totals.vat);
+  grand_totals.wt      = round(grand_totals.wt);
+  grand_totals.penalty = round(grand_totals.penalty);
+  grand_totals.total   = round(grand_totals.total);
+
+  return { meters: results, totals_by_type, grand_totals };
+}
+
 /* =========================
  * Exports
  * ========================= */
@@ -356,6 +459,7 @@ module.exports = {
   // money
   computeBillingForMeter,
   computeBillingForTenant,
+  computeBillingForBuilding,
 
   // helpers
   round,
