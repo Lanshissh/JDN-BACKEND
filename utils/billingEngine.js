@@ -4,13 +4,13 @@
 const { Op } = require('sequelize');
 
 // Models
-const Reading  = require('../models/Reading');   // DATEONLY lastread_date
+const Reading  = require('../models/Reading');
 const Meter    = require('../models/Meter');
 const Stall    = require('../models/Stall');
-const Tenant   = require('../models/Tenant');    // vat_code, wt_code, for_penalty
-const VAT      = require('../models/VAT');       // e_vat, w_vat, l_vat (percent or fraction)
-const WT       = require('../models/WT');        // e_wt, w_wt, l_wt (percent or fraction)
-const Building = require('../models/Building');  // erate_perKwH, emin_con, wrate_perCbM, wmin_con, lrate_perKg
+const Tenant   = require('../models/Tenant');
+const VAT      = require('../models/VAT');
+const WT       = require('../models/WT');
+const Building = require('../models/Building');
 
 /* =========================
  * Small helpers (no DB)
@@ -27,7 +27,7 @@ const normalizePct = (v) => {
   return n >= 1 ? n / 100 : n;
 };
 
-// LPG minimum is fixed (per your instruction)
+// LPG minimum is fixed
 const LPG_MIN_CON = 1;
 
 // YYYY-MM-DD from a UTC Date
@@ -38,7 +38,7 @@ function ymd(d) {
   return `${y}-${m}-${day}`;
 }
 
-// Build string windows (DATEONLY-safe) for current and previous months
+// Current month window from endDate; previous full month window
 function getCurrentPeriodFromEnd(endDateStr) {
   const end = new Date(endDateStr + 'T00:00:00Z');
   const startOfMonth = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1));
@@ -48,7 +48,7 @@ function getCurrentPeriodFromEnd(endDateStr) {
 }
 
 function getPreviousPeriodFromCurrent(currStartStr) {
-  const s = new Date(currStartStr + 'T00:00:00Z'); // first day of current month
+  const s = new Date(currStartStr + 'T00:00:00Z');
   const prevStart = new Date(Date.UTC(s.getUTCFullYear(), s.getUTCMonth() - 1, 1));
   const prevEnd   = new Date(s.getTime() - 24 * 60 * 60 * 1000);
   return { prevStart: ymd(prevStart), prevEnd: ymd(prevEnd) };
@@ -96,21 +96,14 @@ async function getTenantTaxKnobs(tenant) {
  * Core math (Excel-style)
  * ========================= */
 
-/**
- * Rule:
- *  - VAT = base × vat%
- *  - WT  = VAT × wt%           (withholding is a fraction of VAT)
- *  - Pen = for_penalty ? base × penalty% : 0
- *  - Total = base + VAT + Penalty − WT   (withholding is deducted)
- */
 function applyTaxes({ base, vatRate, wtRate, forPenalty, penaltyRate }) {
   const b   = Number(base) || 0;
 
-  const vat = b * (Number(vatRate) || 0);          // base × VAT%
-  const wt  = vat * (Number(wtRate) || 0);         // VAT × WT%
+  const vat = b * (Number(vatRate) || 0);    // base × VAT%
+  const wt  = vat * (Number(wtRate) || 0);   // VAT × WT%
   const pen = forPenalty ? b * (Number(penaltyRate) || 0) : 0;
 
-  const total = b + vat + pen - wt;                // deduct withholding
+  const total = b + vat + pen - wt;          // deduct withholding
 
   return { vat: round(vat), wt: round(wt), penalty: round(pen), total: round(total) };
 }
@@ -161,14 +154,14 @@ function computeChargesByType(mtype, mult, building, taxKnobs, prevIdx, currIdx,
  * ========================= */
 
 /**
- * Compute billing for a single meter for the month containing endDate.
- * @param {Object} params
- * @param {string} params.meterId
- * @param {string} params.endDate     YYYY-MM-DD
- * @param {Object} params.user        current user (for scope check)
- * @param {number} params.penaltyRatePct  Penalty % as PERCENT (e.g., 2 = 2%)
+ * computeBillingForMeter
+ * @param {object} opts
+ *  - meterId: string
+ *  - endDate: YYYY-MM-DD
+ *  - penaltyRatePct?: number (percent)
+ *  - restrictToBuildingIds?: string[] | null
  */
-async function computeBillingForMeter({ meterId, endDate, user, penaltyRatePct = 0 }) {
+async function computeBillingForMeter({ meterId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null }) {
   // Meter → Stall
   const meter = await Meter.findOne({
     where: { meter_id: meterId },
@@ -184,11 +177,13 @@ async function computeBillingForMeter({ meterId, endDate, user, penaltyRatePct =
   });
   if (!stall) { const e = new Error('Stall not found for this meter'); e.status = 404; throw e; }
 
-  // Scope check (non-admin must match building)
-  const lvl = (user?.user_level || '').toLowerCase();
-  if (lvl !== 'admin') {
-    if (!user?.building_id) { const e = new Error('Unauthorized: No building assigned'); e.status = 401; throw e; }
-    if (user.building_id !== stall.building_id) { const e = new Error('No access to this meter'); e.status = 403; throw e; }
+  // Scope (provided by middlewares via req.restrictToBuildingIds)
+  if (Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length) {
+    if (!restrictToBuildingIds.includes(String(stall.building_id))) {
+      const e = new Error('No access to this record’s building');
+      e.status = 403;
+      throw e;
+    }
   }
 
   // Building rates & mins
@@ -209,13 +204,13 @@ async function computeBillingForMeter({ meterId, endDate, user, penaltyRatePct =
 
   const taxKnobs   = await getTenantTaxKnobs(tenant);
   const forPenalty = !!tenant.for_penalty;
-  const penaltyRate = forPenalty ? normalizePct(penaltyRatePct) : 0; // omit if false
+  const penaltyRate = forPenalty ? normalizePct(penaltyRatePct) : 0;
 
-  // Current & previous month windows (DATEONLY strings)
+  // Current & previous month windows
   const { start: currStart, end: currEnd } = getCurrentPeriodFromEnd(endDate);
   const { prevStart, prevEnd }             = getPreviousPeriodFromCurrent(currStart);
 
-  // Pick last reading in each window (by date)
+  // Pick last reading in each window
   const [currMax, prevMax] = await Promise.all([
     getMaxReadingInPeriod(meterId, currStart, currEnd),
     getMaxReadingInPeriod(meterId, prevStart, prevEnd),
@@ -224,7 +219,6 @@ async function computeBillingForMeter({ meterId, endDate, user, penaltyRatePct =
   if (!currMax) { const e = new Error(`No readings for ${currStart}..${currEnd}`); e.status = 400; throw e; }
   if (!prevMax) { const e = new Error(`No readings for ${prevStart}..${prevEnd}`); e.status = 400; throw e; }
 
-  // Single-segment (Excel style): prev → curr
   const mtype = String(meter.meter_type || '').toLowerCase();
   const mult  = Number(meter.meter_mult) || 1;
 
@@ -272,10 +266,14 @@ async function computeBillingForMeter({ meterId, endDate, user, penaltyRatePct =
 }
 
 /**
- * Compute billing for all meters under a tenant (scoped to user's building if not admin).
- * Returns per-meter results and aggregated totals_by_type and grand_totals.
+ * computeBillingForTenant
+ * @param {object} opts
+ *  - tenantId: string
+ *  - endDate: YYYY-MM-DD
+ *  - penaltyRatePct?: number (percent)
+ *  - restrictToBuildingIds?: string[] | null
  */
-async function computeBillingForTenant({ tenantId, endDate, user, penaltyRatePct = 0 }) {
+async function computeBillingForTenant({ tenantId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null }) {
   // All stalls of tenant
   const stalls = await Stall.findAll({
     where: { tenant_id: tenantId },
@@ -284,9 +282,11 @@ async function computeBillingForTenant({ tenantId, endDate, user, penaltyRatePct
   });
   if (!stalls.length) { const e = new Error('No stalls found for this tenant'); e.status = 404; throw e; }
 
-  // Scope to building if not admin
-  const lvl = (user?.user_level || '').toLowerCase();
-  const scopedStalls = (lvl === 'admin') ? stalls : stalls.filter(s => s.building_id === user?.building_id);
+  // Apply building scope if provided by middleware
+  const scopedStalls = Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length
+    ? stalls.filter(s => restrictToBuildingIds.includes(String(s.building_id)))
+    : stalls;
+
   if (!scopedStalls.length) { const e = new Error('No accessible stalls in your building'); e.status = 403; throw e; }
 
   const stallIds = scopedStalls.map(s => s.stall_id);
@@ -300,14 +300,15 @@ async function computeBillingForTenant({ tenantId, endDate, user, penaltyRatePct
   const results = [];
   for (const m of meters) {
     try {
-      const r = await computeBillingForMeter({ meterId: m.meter_id, endDate, user, penaltyRatePct });
+      const r = await computeBillingForMeter({
+        meterId: m.meter_id, endDate, penaltyRatePct, restrictToBuildingIds
+      });
       results.push(r);
     } catch (innerErr) {
       results.push({ meter_id: m.meter_id, error: innerErr.message || 'Billing failed for this meter' });
     }
   }
 
-  // Roll up money by type and grand
   const totals_by_type = {};
   let grand_totals = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
 
@@ -356,7 +357,7 @@ module.exports = {
   computeBillingForMeter,
   computeBillingForTenant,
 
-  // helpers (if you want to reuse elsewhere)
+  // helpers
   round,
   normalizePct,
   getCurrentPeriodFromEnd,
