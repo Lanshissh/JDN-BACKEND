@@ -3,7 +3,6 @@
 
 const { Op } = require('sequelize');
 
-// Models
 const Reading  = require('../models/Reading');
 const Meter    = require('../models/Meter');
 const Stall    = require('../models/Stall');
@@ -12,27 +11,20 @@ const VAT      = require('../models/VAT');
 const WT       = require('../models/WT');
 const Building = require('../models/Building');
 
-/* =========================
- * Small helpers (no DB)
- * ========================= */
-
 function round(n, d = 2) {
   if (n === null || n === undefined || isNaN(n)) return null;
-  return Number(Number(n).toFixed(d));
+  const f = Math.pow(10, d);
+  return Math.round((Number(n) || 0) * f) / f;
 }
 
-// Percent normalizer: 1 -> 0.01, 12 -> 0.12, 0.12 -> 0.12
 const normalizePct = (v) => {
   const n = Number(v) || 0;
   return n >= 1 ? n / 100 : n;
 };
 
-// LPG minimum is fixed
 const LPG_MIN_CON = 1;
-
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-// YYYY-MM-DD from a UTC Date
 function ymd(d) {
   const y = d.getUTCFullYear();
   const m = String(d.getUTCMonth() + 1).padStart(2, '0');
@@ -40,55 +32,58 @@ function ymd(d) {
   return `${y}-${m}-${day}`;
 }
 
-/**
- * Split the rolling 1-month window (inclusive) that ends on endDate
- * into two calendar-based segments:
- *  - prev segment:  ((endDate - 1 month) + 1 day) .. last day of previous month
- *  - curr segment:  first day of endDate's month .. endDate
- *
- * Example: endDate = 2025-02-20
- *   prev: 2025-01-21 .. 2025-01-31
- *   curr: 2025-02-01 .. 2025-02-20
- */
+function isYMD(s) {
+  return typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+}
+
+function getPeriodStrings(endDateStr) {
+  if (!isYMD(endDateStr)) {
+    const err = new Error('Invalid end_date format. Use YYYY-MM-DD.');
+    err.status = 400;
+    throw err;
+  }
+  const end = new Date(endDateStr + 'T00:00:00Z');
+  const firstOfMonth = (y, m) => new Date(Date.UTC(y, m, 1));
+  const lastOfMonth  = (y, m) => new Date(Date.UTC(y, m + 1, 1) - DAY_MS);
+  const y = end.getUTCFullYear();
+  const m = end.getUTCMonth();
+  const currStart = firstOfMonth(y, m);
+  const currEnd   = end;
+  const prevYear  = m === 0 ? y - 1 : y;
+  const prevMonth = m === 0 ? 11 : m - 1;
+  const prevStart = firstOfMonth(prevYear, prevMonth);
+  const prevEnd   = lastOfMonth(prevYear, prevMonth);
+  const pprevYear  = prevMonth === 0 ? prevYear - 1 : prevYear;
+  const pprevMonth = prevMonth === 0 ? 11 : prevMonth - 1;
+  const prePrevStart = firstOfMonth(pprevYear, pprevMonth);
+  const prePrevEnd   = lastOfMonth(pprevYear, pprevMonth);
+  return {
+    curr:    { start: ymd(currStart),    end: ymd(currEnd) },
+    prev:    { start: ymd(prevStart),    end: ymd(prevEnd) },
+    preprev: { start: ymd(prePrevStart), end: ymd(prePrevEnd) },
+  };
+}
+
 function getTwoSegmentWindow(endDateStr) {
   const end = new Date(endDateStr + 'T00:00:00Z');
-
-  // Start of end month, and end of previous month
   const endMonthStart = new Date(Date.UTC(end.getUTCFullYear(), end.getUTCMonth(), 1));
   const prevMonthEnd  = new Date(endMonthStart.getTime() - DAY_MS);
-
-  // "(end - 1 month)" keeping same day where possible, then +1 day
   const oneMonthEarlier = new Date(Date.UTC(
     end.getUTCFullYear(),
     end.getUTCMonth() - 1,
     end.getUTCDate()
   ));
   const overallStart = new Date(oneMonthEarlier.getTime() + DAY_MS);
-
-  const prevSegStart = overallStart;
-  const prevSegEnd   = prevMonthEnd;
+  const prevSegStart = overallStart.getUTCDate() === 1 ? null : overallStart;
+  const prevSegEnd   = overallStart.getUTCDate() === 1 ? null : prevMonthEnd;
   const currSegStart = endMonthStart;
   const currSegEnd   = end;
-
-  // Guard: if prev segment would be empty, fold everything into current
-  if (prevSegStart > prevSegEnd) {
-    return {
-      prev: null,
-      curr: { start: ymd(overallStart), end: ymd(currSegEnd) }
-    };
-  }
-
   return {
-    prev: { start: ymd(prevSegStart), end: ymd(prevSegEnd) },
+    prev: prevSegStart ? { start: ymd(prevSegStart), end: ymd(prevSegEnd) } : null,
     curr: { start: ymd(currSegStart), end: ymd(currSegEnd) },
   };
 }
 
-/* =========================
- * DB helpers
- * ========================= */
-
-// Latest reading (by date) in a DATEONLY window [start, end] inclusive
 async function getMaxReadingInPeriod(meter_id, startStr, endStr) {
   const row = await Reading.findOne({
     where: {
@@ -101,13 +96,11 @@ async function getMaxReadingInPeriod(meter_id, startStr, endStr) {
   return row ? { value: Number(row.reading_value) || 0, date: row.lastread_date } : null;
 }
 
-// Pull VAT/WT per tenant codes (returns FRACTIONS)
 async function getTenantTaxKnobs(tenant) {
   const [vatRow, wtRow] = await Promise.all([
     tenant?.vat_code ? VAT.findOne({ where: { vat_code: tenant.vat_code }, raw: true }) : null,
     tenant?.wt_code  ? WT.findOne({ where: { wt_code:  tenant.wt_code  }, raw: true }) : null,
   ]);
-
   const vat = {
     e: normalizePct(vatRow?.e_vat || 0),
     w: normalizePct(vatRow?.w_vat || 0),
@@ -118,27 +111,18 @@ async function getTenantTaxKnobs(tenant) {
     w: normalizePct(wtRow?.w_wt || 0),
     l: normalizePct(wtRow?.l_wt || 0),
   };
-
   return { vat, wt };
 }
 
-/* =========================
- * Core math (Excel-style)
- * ========================= */
-
 function applyTaxes({ base, vatRate, wtRate, forPenalty, penaltyRate }) {
-  const b   = Number(base) || 0;
-
-  const vat = b * (Number(vatRate) || 0);    // base × VAT%
-  const wt  = vat * (Number(wtRate) || 0);   // VAT × WT%
+  const b = Number(base) || 0;
+  const vat = b * (Number(vatRate) || 0);
+  const wt  = vat * (Number(wtRate) || 0);
   const pen = forPenalty ? b * (Number(penaltyRate) || 0) : 0;
-
-  const total = b + vat + pen - wt;          // deduct withholding
-
+  const total = b + vat + pen - wt;
   return { vat: round(vat), wt: round(wt), penalty: round(pen), total: round(total) };
 }
 
-// Base per-utility rate from building
 function getUtilityRate(mtype, building) {
   const t = String(mtype || '').toLowerCase();
   if (t === 'electric') return Number(building.erate_perKwH) || 0;
@@ -155,27 +139,36 @@ function getMinConsumption(mtype, building) {
   throw new Error(`Unsupported meter type: ${t}`);
 }
 
-// Compute with original (no markup) rates
+function computeUnitsOnly(meterType, meterMult, building, prevIdx, currIdx) {
+  const t = String(meterType || '').toLowerCase();
+  const mult = Number(meterMult) || 1;
+  const prev = Number(prevIdx) || 0;
+  const curr = Number(currIdx) || 0;
+  const raw = (curr - prev) * mult;
+  if (t === 'electric') {
+    const min = Number(building.emin_con) || 0;
+    return round(raw > 0 ? raw : min);
+  }
+  if (t === 'water') {
+    const min = Number(building.wmin_con) || 0;
+    return round(raw > 0 ? raw : min);
+  }
+  if (t === 'lpg') {
+    return round(raw > 0 ? raw : LPG_MIN_CON);
+  }
+  throw new Error(`Unsupported meter type: ${t}`);
+}
+
 function computeChargesByType(
   mtype, mult, building, taxKnobs, prevIdx, currIdx, forPenalty, penaltyRate
 ) {
   const t = String(mtype || '').toLowerCase();
-  const k = Number(mult) || 1;
-  const prev = Number(prevIdx) || 0;
-  const curr = Number(currIdx) || 0;
-
-  const raw = (curr - prev) * k;
-
-  const min  = getMinConsumption(t, building);
   const rate = getUtilityRate(t, building);
-
   const vatR = t === 'electric' ? taxKnobs.vat.e : t === 'water' ? taxKnobs.vat.w : taxKnobs.vat.l;
   const wtR  = t === 'electric' ? taxKnobs.wt.e  : t === 'water' ? taxKnobs.wt.w  : taxKnobs.wt.l;
-
-  const consumption = raw > 0 ? raw : min;
+  const consumption = computeUnitsOnly(t, mult, building, prevIdx, currIdx);
   const base = consumption * rate;
   const taxes = applyTaxes({ base, vatRate: vatR, wtRate: wtR, forPenalty, penaltyRate });
-
   return {
     consumption: round(consumption),
     base: round(base),
@@ -183,38 +176,22 @@ function computeChargesByType(
     wt: taxes.wt,
     penalty: taxes.penalty,
     total: taxes.total,
-    rates: {
-      utility_rate: round(rate, 6),
-      markup_rate: 0,
-      system_rate: round(rate, 6),
-    }
+    rates: { utility_rate: rate, markup_rate: 0, system_rate: rate },
   };
 }
 
-// Compute using markup (system_rate = utility_rate + markup_rate)
-// markup_rate is a single building field applied to all utility types
 function computeChargesByTypeWithMarkup(
   mtype, mult, building, taxKnobs, prevIdx, currIdx, forPenalty, penaltyRate
 ) {
   const t = String(mtype || '').toLowerCase();
-  const k = Number(mult) || 1;
-  const prev = Number(prevIdx) || 0;
-  const curr = Number(currIdx) || 0;
-
-  const raw = (curr - prev) * k;
-
-  const min         = getMinConsumption(t, building);
   const utilityRate = getUtilityRate(t, building);
-  const markup      = Number(building.markup_rate) || 0; // one markup for all utilities
+  const markup      = Number(building.markup_rate) || 0;
   const systemRate  = utilityRate + markup;
-
   const vatR = t === 'electric' ? taxKnobs.vat.e : t === 'water' ? taxKnobs.vat.w : taxKnobs.vat.l;
   const wtR  = t === 'electric' ? taxKnobs.wt.e  : t === 'water' ? taxKnobs.wt.w  : taxKnobs.wt.l;
-
-  const consumption = raw > 0 ? raw : min;
-  const base = consumption * systemRate; // base now uses systemRate
+  const consumption = computeUnitsOnly(t, mult, building, prevIdx, currIdx);
+  const base = consumption * systemRate;
   const taxes = applyTaxes({ base, vatRate: vatR, wtRate: wtR, forPenalty, penaltyRate });
-
   return {
     consumption: round(consumption),
     base: round(base),
@@ -222,22 +199,13 @@ function computeChargesByTypeWithMarkup(
     wt: taxes.wt,
     penalty: taxes.penalty,
     total: taxes.total,
-    rates: {
-      utility_rate: round(utilityRate, 6),
-      markup_rate:  round(markup, 6),
-      system_rate:  round(systemRate, 6),
-    }
+    rates: { utility_rate: utilityRate, markup_rate: markup, system_rate: systemRate },
   };
 }
-
-/* =========================
- * Public API — Billing
- * ========================= */
 
 async function computeBillingForMeter({
   meterId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
 }) {
-  // Meter → Stall
   const meter = await Meter.findOne({
     where: { meter_id: meterId },
     attributes: ['meter_id', 'meter_sn', 'meter_type', 'meter_mult', 'stall_id'],
@@ -252,7 +220,6 @@ async function computeBillingForMeter({
   });
   if (!stall) { const e = new Error('Stall not found for this meter'); e.status = 404; throw e; }
 
-  // Scope (provided by middlewares via req.restrictToBuildingIds)
   if (Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length) {
     if (!restrictToBuildingIds.includes(String(stall.building_id))) {
       const e = new Error('No access to this record’s building');
@@ -261,45 +228,50 @@ async function computeBillingForMeter({
     }
   }
 
-  // Building rates (include markup_rate)
   const building = await Building.findOne({
     where: { building_id: stall.building_id },
-    attributes: ['building_id','erate_perKwH','emin_con','wrate_perCbM','wmin_con','lrate_perKg','markup_rate'],
+    attributes: [
+      'building_id',
+      'emin_con','wmin_con',
+      'erate_perKwH','wrate_perCbM','lrate_perKg',
+      'markup_rate'
+    ],
     raw: true
   });
-  if (!building) { const e = new Error('Building configuration not found'); e.status = 400; throw e; }
+  if (!building) { const e = new Error('Building not found'); e.status = 404; throw e; }
 
-  // Tenant tax knobs and penalty flag
   const tenant = await Tenant.findOne({
     where: { tenant_id: stall.tenant_id },
     attributes: ['tenant_id','tenant_name','vat_code','wt_code','for_penalty'],
     raw: true
   });
-  if (!tenant) { const e = new Error('Tenant not found'); e.status = 400; throw e; }
+  if (!tenant) { const e = new Error('Tenant not found'); e.status = 404; throw e; }
 
-  const taxKnobs   = await getTenantTaxKnobs(tenant);
+  const taxKnobs = await getTenantTaxKnobs(tenant);
   const forPenalty = !!tenant.for_penalty;
-  const penaltyRate = forPenalty ? normalizePct(penaltyRatePct) : 0;
+  const penaltyRate = normalizePct(penaltyRatePct);
 
-  // Two segments inside the covered month span
-  const { prev, curr } = getTwoSegmentWindow(endDate);
-
+  const indexPeriods = getPeriodStrings(endDate);
   const [prevMax, currMax] = await Promise.all([
-    prev ? getMaxReadingInPeriod(meterId, prev.start, prev.end) : null,
-    getMaxReadingInPeriod(meterId, curr.start, curr.end),
+    getMaxReadingInPeriod(meterId, indexPeriods.prev.start, indexPeriods.prev.end),
+    getMaxReadingInPeriod(meterId, indexPeriods.curr.start, indexPeriods.curr.end),
   ]);
+  if (!currMax) { const e = new Error(`No readings for ${indexPeriods.curr.start}..${indexPeriods.curr.end}`); e.status = 400; throw e; }
+  if (!prevMax) { const e = new Error(`No readings for ${indexPeriods.prev.start}..${indexPeriods.prev.end}`); e.status = 400; throw e; }
 
-  if (!currMax) { const e = new Error(`No readings for ${curr.start}..${curr.end}`); e.status = 400; throw e; }
-  if (!prevMax) { const e = new Error(`No readings for ${prev?.start}..${prev?.end}`); e.status = 400; throw e; }
+  const displayPeriods = getTwoSegmentWindow(endDate);
 
   const mtype = String(meter.meter_type || '').toLowerCase();
   const mult  = Number(meter.meter_mult) || 1;
 
-  // ORIGINAL (no markup)
   const bill = computeChargesByType(
     mtype, mult, building, taxKnobs, prevMax.value, currMax.value, forPenalty, penaltyRate
   );
 
+  const prevUnits = computeUnitsOnly(mtype, mult, building, prevMax.value - (mult || 1), prevMax.value);
+  const currUnits = bill.consumption;
+  const rateOfChangePercent = prevUnits > 0 ? round(((currUnits - prevUnits) / prevUnits) * 100, 0) : 0;
+
   return {
     meter: {
       meter_id: meter.meter_id,
@@ -320,8 +292,8 @@ async function computeBillingForMeter({
       for_penalty: forPenalty,
     },
     period: {
-      previous: prev,
-      current: curr,
+      previous: displayPeriods.prev,
+      current: displayPeriods.curr,
     },
     indices: {
       prev_index: round(prevMax.value, 2),
@@ -335,15 +307,15 @@ async function computeBillingForMeter({
       wt: bill.wt,
       penalty: bill.penalty,
       total: bill.total,
-    }
+    },
+    rate_of_change_percent: rateOfChangePercent,
+    generated_at: new Date().toISOString().replace('T', ' ').slice(0, 19)
   };
 }
 
-// WITH MARKUP — same shape; billing.rates has {utility_rate, markup_rate, system_rate}
 async function computeBillingForMeterWithMarkup({
   meterId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
 }) {
-  // Meter → Stall
   const meter = await Meter.findOne({
     where: { meter_id: meterId },
     attributes: ['meter_id', 'meter_sn', 'meter_type', 'meter_mult', 'stall_id'],
@@ -366,43 +338,49 @@ async function computeBillingForMeterWithMarkup({
     }
   }
 
-  // Include markup_rate
   const building = await Building.findOne({
     where: { building_id: stall.building_id },
-    attributes: ['building_id','erate_perKwH','emin_con','wrate_perCbM','wmin_con','lrate_perKg','markup_rate'],
+    attributes: [
+      'building_id',
+      'emin_con','wmin_con',
+      'erate_perKwH','wrate_perCbM','lrate_perKg',
+      'markup_rate'
+    ],
     raw: true
   });
-  if (!building) { const e = new Error('Building configuration not found'); e.status = 400; throw e; }
+  if (!building) { const e = new Error('Building not found'); e.status = 404; throw e; }
 
   const tenant = await Tenant.findOne({
     where: { tenant_id: stall.tenant_id },
     attributes: ['tenant_id','tenant_name','vat_code','wt_code','for_penalty'],
     raw: true
   });
-  if (!tenant) { const e = new Error('Tenant not found'); e.status = 400; throw e; }
+  if (!tenant) { const e = new Error('Tenant not found'); e.status = 404; throw e; }
 
-  const taxKnobs   = await getTenantTaxKnobs(tenant);
+  const taxKnobs = await getTenantTaxKnobs(tenant);
   const forPenalty = !!tenant.for_penalty;
-  const penaltyRate = forPenalty ? normalizePct(penaltyRatePct) : 0;
+  const penaltyRate = normalizePct(penaltyRatePct);
 
-  // Two segments inside the covered month span
-  const { prev, curr } = getTwoSegmentWindow(endDate);
-
+  const indexPeriods = getPeriodStrings(endDate);
   const [prevMax, currMax] = await Promise.all([
-    prev ? getMaxReadingInPeriod(meter.meter_id, prev.start, prev.end) : null,
-    getMaxReadingInPeriod(meter.meter_id, curr.start, curr.end),
+    getMaxReadingInPeriod(meter.meter_id, indexPeriods.prev.start, indexPeriods.prev.end),
+    getMaxReadingInPeriod(meter.meter_id, indexPeriods.curr.start, indexPeriods.curr.end),
   ]);
+  if (!currMax) { const e = new Error(`No readings for ${indexPeriods.curr.start}..${indexPeriods.curr.end}`); e.status = 400; throw e; }
+  if (!prevMax) { const e = new Error(`No readings for ${indexPeriods.prev.start}..${indexPeriods.prev.end}`); e.status = 400; throw e; }
 
-  if (!currMax) { const e = new Error(`No readings for ${curr.start}..${curr.end}`); e.status = 400; throw e; }
-  if (!prevMax) { const e = new Error(`No readings for ${prev?.start}..${prev?.end}`); e.status = 400; throw e; }
+  const displayPeriods = getTwoSegmentWindow(endDate);
 
   const mtype = String(meter.meter_type || '').toLowerCase();
   const mult  = Number(meter.meter_mult) || 1;
 
-  // WITH MARKUP
   const bill = computeChargesByTypeWithMarkup(
     mtype, mult, building, taxKnobs, prevMax.value, currMax.value, forPenalty, penaltyRate
   );
+
+  const prevUnits = computeUnitsOnly(mtype, mult, building, prevMax.value - (mult || 1), prevMax.value);
+  const currUnits = bill.consumption;
+  const rateOfChangePercent = prevUnits > 0 ? round(((currUnits - prevUnits) / prevUnits) * 100, 0) : 0;
 
   return {
     meter: {
@@ -424,8 +402,8 @@ async function computeBillingForMeterWithMarkup({
       for_penalty: forPenalty,
     },
     period: {
-      previous: prev,
-      current: curr,
+      previous: displayPeriods.prev,
+      current: displayPeriods.curr,
     },
     indices: {
       prev_index: round(prevMax.value, 2),
@@ -439,70 +417,58 @@ async function computeBillingForMeterWithMarkup({
       wt: bill.wt,
       penalty: bill.penalty,
       total: bill.total,
-    }
+    },
+    rate_of_change_percent: rateOfChangePercent,
+    generated_at: new Date().toISOString().replace('T', ' ').slice(0, 19)
   };
 }
 
-/** Tenant (no markup) */
 async function computeBillingForTenant({
   tenantId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
 }) {
-  // All stalls of tenant
   const stalls = await Stall.findAll({
     where: { tenant_id: tenantId },
-    attributes: ['stall_id', 'building_id'],
+    attributes: ['stall_id','building_id','tenant_id'],
     raw: true
   });
-  if (!stalls.length) { const e = new Error('No stalls found for this tenant'); e.status = 404; throw e; }
 
-  // Apply building scope if provided by middleware
-  const scopedStalls = Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length
-    ? stalls.filter(s => restrictToBuildingIds.includes(String(s.building_id)))
-    : stalls;
-
-  if (!scopedStalls.length) { const e = new Error('No accessible stalls in your building'); e.status = 403; throw e; }
-
-  const stallIds = scopedStalls.map(s => s.stall_id);
-  const meters = await Meter.findAll({
-    where: { stall_id: { [Op.in]: stallIds } },
-    attributes: ['meter_id'],
-    raw: true
-  });
-  if (!meters.length) { const e = new Error('No meters for this tenant (in your scope)'); e.status = 404; throw e; }
-
-  const results = [];
-  for (const m of meters) {
-    try {
-      const r = await computeBillingForMeter({
-        meterId: m.meter_id, endDate, penaltyRatePct, restrictToBuildingIds
-      });
-      results.push(r);
-    } catch (innerErr) {
-      results.push({ meter_id: m.meter_id, error: innerErr.message || 'Billing failed for this meter' });
-    }
+  if (!stalls.length) {
+    return { meters: [], totals_by_type: { electric:{base:0,vat:0,wt:0,penalty:0,total:0}, water:{base:0,vat:0,wt:0,penalty:0,total:0}, lpg:{base:0,vat:0,wt:0,penalty:0,total:0} }, grand_totals: { base:0,vat:0,wt:0,penalty:0,total:0 } };
   }
 
-  const totals_by_type = {};
-  let grand_totals = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
+  const meters = await Meter.findAll({
+    where: { stall_id: { [Op.in]: stalls.map(s => s.stall_id) } },
+    attributes: ['meter_id','meter_sn','meter_type','meter_mult','stall_id'],
+    raw: true
+  });
 
-  for (const r of results) {
-    if (r.error) continue;
-    const t = r.meter.meter_type;
-    const b = r.totals;
+  const results = [];
+  const totals_by_type = {
+    electric: { base:0, vat:0, wt:0, penalty:0, total:0 },
+    water:    { base:0, vat:0, wt:0, penalty:0, total:0 },
+    lpg:      { base:0, vat:0, wt:0, penalty:0, total:0 }
+  };
+  const grand_totals = { base:0, vat:0, wt:0, penalty:0, total:0 };
 
-    if (!totals_by_type[t]) totals_by_type[t] = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
-
-    totals_by_type[t].base    += b.base;
-    totals_by_type[t].vat     += b.vat;
-    totals_by_type[t].wt      += b.wt;
-    totals_by_type[t].penalty += b.penalty;
-    totals_by_type[t].total   += b.total;
-
-    grand_totals.base    += b.base;
-    grand_totals.vat     += b.vat;
-    grand_totals.wt      += b.wt;
-    grand_totals.penalty += b.penalty;
-    grand_totals.total   += b.total;
+  for (const m of meters) {
+    const r = await computeBillingForMeter({
+      meterId: m.meter_id,
+      endDate,
+      penaltyRatePct,
+      restrictToBuildingIds
+    });
+    results.push(r);
+    const k = r.meter.meter_type;
+    totals_by_type[k].base    += r.billing.base;
+    totals_by_type[k].vat     += r.billing.vat;
+    totals_by_type[k].wt      += r.billing.wt;
+    totals_by_type[k].penalty += r.billing.penalty;
+    totals_by_type[k].total   += r.billing.total;
+    grand_totals.base    += r.billing.base;
+    grand_totals.vat     += r.billing.vat;
+    grand_totals.wt      += r.billing.wt;
+    grand_totals.penalty += r.billing.penalty;
+    grand_totals.total   += r.billing.total;
   }
 
   Object.keys(totals_by_type).forEach(k => {
@@ -512,7 +478,6 @@ async function computeBillingForTenant({
     totals_by_type[k].penalty = round(totals_by_type[k].penalty);
     totals_by_type[k].total   = round(totals_by_type[k].total);
   });
-
   grand_totals.base    = round(grand_totals.base);
   grand_totals.vat     = round(grand_totals.vat);
   grand_totals.wt      = round(grand_totals.wt);
@@ -522,64 +487,52 @@ async function computeBillingForTenant({
   return { meters: results, totals_by_type, grand_totals };
 }
 
-/** Tenant (with markup) */
 async function computeBillingForTenantWithMarkup({
   tenantId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
 }) {
   const stalls = await Stall.findAll({
     where: { tenant_id: tenantId },
-    attributes: ['stall_id', 'building_id'],
+    attributes: ['stall_id','building_id','tenant_id'],
     raw: true
   });
-  if (!stalls.length) { const e = new Error('No stalls found for this tenant'); e.status = 404; throw e; }
 
-  const scopedStalls = Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length
-    ? stalls.filter(s => restrictToBuildingIds.includes(String(s.building_id)))
-    : stalls;
-
-  if (!scopedStalls.length) { const e = new Error('No accessible stalls in your building'); e.status = 403; throw e; }
-
-  const stallIds = scopedStalls.map(s => s.stall_id);
-  const meters = await Meter.findAll({
-    where: { stall_id: { [Op.in]: stallIds } },
-    attributes: ['meter_id'],
-    raw: true
-  });
-  if (!meters.length) { const e = new Error('No meters for this tenant (in your scope)'); e.status = 404; throw e; }
-
-  const results = [];
-  for (const m of meters) {
-    try {
-      const r = await computeBillingForMeterWithMarkup({
-        meterId: m.meter_id, endDate, penaltyRatePct, restrictToBuildingIds
-      });
-      results.push(r);
-    } catch (innerErr) {
-      results.push({ meter_id: m.meter_id, error: innerErr.message || 'Billing failed for this meter' });
-    }
+  if (!stalls.length) {
+    return { meters: [], totals_by_type: { electric:{base:0,vat:0,wt:0,penalty:0,total:0}, water:{base:0,vat:0,wt:0,penalty:0,total:0}, lpg:{base:0,vat:0,wt:0,penalty:0,total:0} }, grand_totals: { base:0,vat:0,wt:0,penalty:0,total:0 } };
   }
 
-  const totals_by_type = {};
-  let grand_totals = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
+  const meters = await Meter.findAll({
+    where: { stall_id: { [Op.in]: stalls.map(s => s.stall_id) } },
+    attributes: ['meter_id','meter_sn','meter_type','meter_mult','stall_id'],
+    raw: true
+  });
 
-  for (const r of results) {
-    if (r.error) continue;
-    const t = r.meter.meter_type;
-    const b = r.totals;
+  const results = [];
+  const totals_by_type = {
+    electric: { base:0, vat:0, wt:0, penalty:0, total:0 },
+    water:    { base:0, vat:0, wt:0, penalty:0, total:0 },
+    lpg:      { base:0, vat:0, wt:0, penalty:0, total:0 }
+  };
+  const grand_totals = { base:0, vat:0, wt:0, penalty:0, total:0 };
 
-    if (!totals_by_type[t]) totals_by_type[t] = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
-
-    totals_by_type[t].base    += b.base;
-    totals_by_type[t].vat     += b.vat;
-    totals_by_type[t].wt      += b.wt;
-    totals_by_type[t].penalty += b.penalty;
-    totals_by_type[t].total   += b.total;
-
-    grand_totals.base    += b.base;
-    grand_totals.vat     += b.vat;
-    grand_totals.wt      += b.wt;
-    grand_totals.penalty += b.penalty;
-    grand_totals.total   += b.total;
+  for (const m of meters) {
+    const r = await computeBillingForMeterWithMarkup({
+      meterId: m.meter_id,
+      endDate,
+      penaltyRatePct,
+      restrictToBuildingIds
+    });
+    results.push(r);
+    const k = r.meter.meter_type;
+    totals_by_type[k].base    += r.billing.base;
+    totals_by_type[k].vat     += r.billing.vat;
+    totals_by_type[k].wt      += r.billing.wt;
+    totals_by_type[k].penalty += r.billing.penalty;
+    totals_by_type[k].total   += r.billing.total;
+    grand_totals.base    += r.billing.base;
+    grand_totals.vat     += r.billing.vat;
+    grand_totals.wt      += r.billing.wt;
+    grand_totals.penalty += r.billing.penalty;
+    grand_totals.total   += r.billing.total;
   }
 
   Object.keys(totals_by_type).forEach(k => {
@@ -589,7 +542,6 @@ async function computeBillingForTenantWithMarkup({
     totals_by_type[k].penalty = round(totals_by_type[k].penalty);
     totals_by_type[k].total   = round(totals_by_type[k].total);
   });
-
   grand_totals.base    = round(grand_totals.base);
   grand_totals.vat     = round(grand_totals.vat);
   grand_totals.wt      = round(grand_totals.wt);
@@ -599,7 +551,80 @@ async function computeBillingForTenantWithMarkup({
   return { meters: results, totals_by_type, grand_totals };
 }
 
-/** Building (no markup) */
+
+async function computeBillingForTenantWithMarkup({
+  tenantId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
+}) {
+  const stalls = await Stall.findAll({
+    where: { tenant_id: tenantId },
+    attributes: ['stall_id','building_id','tenant_id'],
+    raw: true
+  });
+
+  if (!stalls.length) {
+    return {
+      meters: [],
+      totals_by_type: {
+        electric: { base:0, vat:0, wt:0, penalty:0, total:0 },
+        water:    { base:0, vat:0, wt:0, penalty:0, total:0 },
+        lpg:      { base:0, vat:0, wt:0, penalty:0, total:0 }
+      },
+      grand_totals: { base:0, vat:0, wt:0, penalty:0, total:0 }
+    };
+  }
+
+  const meters = await Meter.findAll({
+    where: { stall_id: { [Op.in]: stalls.map(s => s.stall_id) } },
+    attributes: ['meter_id','meter_sn','meter_type','meter_mult','stall_id'],
+    raw: true
+  });
+
+  const results = [];
+  const totals_by_type = {
+    electric: { base:0, vat:0, wt:0, penalty:0, total:0 },
+    water:    { base:0, vat:0, wt:0, penalty:0, total:0 },
+    lpg:      { base:0, vat:0, wt:0, penalty:0, total:0 }
+  };
+  const grand_totals = { base:0, vat:0, wt:0, penalty:0, total:0 };
+
+  for (const m of meters) {
+    const r = await computeBillingForMeterWithMarkup({
+      meterId: m.meter_id,
+      endDate,
+      penaltyRatePct,
+      restrictToBuildingIds
+    });
+    results.push(r);
+    const k = r.meter.meter_type;
+    totals_by_type[k].base    += r.billing.base;
+    totals_by_type[k].vat     += r.billing.vat;
+    totals_by_type[k].wt      += r.billing.wt;
+    totals_by_type[k].penalty += r.billing.penalty;
+    totals_by_type[k].total   += r.billing.total;
+    grand_totals.base    += r.billing.base;
+    grand_totals.vat     += r.billing.vat;
+    grand_totals.wt      += r.billing.wt;
+    grand_totals.penalty += r.billing.penalty;
+    grand_totals.total   += r.billing.total;
+  }
+
+  Object.keys(totals_by_type).forEach(k => {
+    totals_by_type[k].base    = round(totals_by_type[k].base);
+    totals_by_type[k].vat     = round(totals_by_type[k].vat);
+    totals_by_type[k].wt      = round(totals_by_type[k].wt);
+    totals_by_type[k].penalty = round(totals_by_type[k].penalty);
+    totals_by_type[k].total   = round(totals_by_type[k].total);
+  });
+  grand_totals.base    = round(grand_totals.base);
+  grand_totals.vat     = round(grand_totals.vat);
+  grand_totals.wt      = round(grand_totals.wt);
+  grand_totals.penalty = round(grand_totals.penalty);
+  grand_totals.total   = round(grand_totals.total);
+
+  return { meters: results, totals_by_type, grand_totals };
+}
+
+
 async function computeBillingForBuilding({
   buildingId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
 }) {
@@ -615,66 +640,55 @@ async function computeBillingForBuilding({
 
   const stalls = await Stall.findAll({
     where: { building_id: bid },
-    attributes: ['stall_id'],
-    raw: true,
+    attributes: ['stall_id','building_id','tenant_id'],
+    raw: true
   });
-  if (!stalls.length) {
-    const e = new Error('No stalls found for this building');
-    e.status = 404;
-    throw e;
-  }
 
-  const stallIds = stalls.map(s => s.stall_id);
   const meters = await Meter.findAll({
-    where: { stall_id: { [Op.in]: stallIds } },
-    attributes: ['meter_id'],
-    raw: true,
+    where: { stall_id: { [Op.in]: stalls.map(s => s.stall_id) } },
+    attributes: ['meter_id','meter_sn','meter_type','meter_mult','stall_id'],
+    raw: true
   });
-  if (!meters.length) {
-    const e = new Error('No meters found for this building');
-    e.status = 404;
-    throw e;
-  }
 
   const results = [];
+  const totals_by_type = {
+    electric: { base:0, vat:0, wt:0, penalty:0, total:0 },
+    water:    { base:0, vat:0, wt:0, penalty:0, total:0 },
+    lpg:      { base:0, vat:0, wt:0, penalty:0, total:0 }
+  };
+  const grand_totals = { base:0, vat:0, wt:0, penalty:0, total:0 };
+
   for (const m of meters) {
     try {
       const r = await computeBillingForMeter({
         meterId: m.meter_id,
         endDate,
         penaltyRatePct,
-        restrictToBuildingIds,
+        restrictToBuildingIds
       });
+
       results.push(r);
-    } catch (innerErr) {
-      results.push({ meter_id: m.meter_id, error: innerErr.message || 'Billing failed for this meter' });
+
+      const k = r.meter.meter_type;
+      totals_by_type[k].base    += r.billing.base;
+      totals_by_type[k].vat     += r.billing.vat;
+      totals_by_type[k].wt      += r.billing.wt;
+      totals_by_type[k].penalty += r.billing.penalty;
+      totals_by_type[k].total   += r.billing.total;
+
+      grand_totals.base    += r.billing.base;
+      grand_totals.vat     += r.billing.vat;
+      grand_totals.wt      += r.billing.wt;
+      grand_totals.penalty += r.billing.penalty;
+      grand_totals.total   += r.billing.total;
+    } catch (e) {
+      if (String(e?.message || '').toLowerCase() === 'tenant not found') {
+        continue;
+      }
+      throw e;
     }
   }
 
-  const totals_by_type = {};
-  let grand_totals = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
-
-  for (const r of results) {
-    if (r?.error) continue;
-    const t = r.meter.meter_type;
-    const b = r.totals;
-
-    if (!totals_by_type[t]) totals_by_type[t] = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
-
-    totals_by_type[t].base    += b.base;
-    totals_by_type[t].vat     += b.vat;
-    totals_by_type[t].wt      += b.wt;
-    totals_by_type[t].penalty += b.penalty;
-    totals_by_type[t].total   += b.total;
-
-    grand_totals.base    += b.base;
-    grand_totals.vat     += b.vat;
-    grand_totals.wt      += b.wt;
-    grand_totals.penalty += b.penalty;
-    grand_totals.total   += b.total;
-  }
-
-  // Round aggregated totals
   Object.keys(totals_by_type).forEach(k => {
     totals_by_type[k].base    = round(totals_by_type[k].base);
     totals_by_type[k].vat     = round(totals_by_type[k].vat);
@@ -692,7 +706,7 @@ async function computeBillingForBuilding({
   return { meters: results, totals_by_type, grand_totals };
 }
 
-/** Building (with markup) */
+
 async function computeBillingForBuildingWithMarkup({
   buildingId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
 }) {
@@ -708,63 +722,53 @@ async function computeBillingForBuildingWithMarkup({
 
   const stalls = await Stall.findAll({
     where: { building_id: bid },
-    attributes: ['stall_id'],
-    raw: true,
+    attributes: ['stall_id','building_id','tenant_id'],
+    raw: true
   });
-  if (!stalls.length) {
-    const e = new Error('No stalls found for this building');
-    e.status = 404;
-    throw e;
-  }
 
-  const stallIds = stalls.map(s => s.stall_id);
   const meters = await Meter.findAll({
-    where: { stall_id: { [Op.in]: stallIds } },
-    attributes: ['meter_id'],
-    raw: true,
+    where: { stall_id: { [Op.in]: stalls.map(s => s.stall_id) } },
+    attributes: ['meter_id','meter_sn','meter_type','meter_mult','stall_id'],
+    raw: true
   });
-  if (!meters.length) {
-    const e = new Error('No meters found for this building');
-    e.status = 404;
-    throw e;
-  }
 
   const results = [];
+  const totals_by_type = {
+    electric: { base:0, vat:0, wt:0, penalty:0, total:0 },
+    water:    { base:0, vat:0, wt:0, penalty:0, total:0 },
+    lpg:      { base:0, vat:0, wt:0, penalty:0, total:0 }
+  };
+  const grand_totals = { base:0, vat:0, wt:0, penalty:0, total:0 };
+
   for (const m of meters) {
     try {
       const r = await computeBillingForMeterWithMarkup({
         meterId: m.meter_id,
         endDate,
         penaltyRatePct,
-        restrictToBuildingIds,
+        restrictToBuildingIds
       });
+
       results.push(r);
-    } catch (innerErr) {
-      results.push({ meter_id: m.meter_id, error: innerErr.message || 'Billing failed for this meter' });
+
+      const k = r.meter.meter_type;
+      totals_by_type[k].base    += r.billing.base;
+      totals_by_type[k].vat     += r.billing.vat;
+      totals_by_type[k].wt      += r.billing.wt;
+      totals_by_type[k].penalty += r.billing.penalty;
+      totals_by_type[k].total   += r.billing.total;
+
+      grand_totals.base    += r.billing.base;
+      grand_totals.vat     += r.billing.vat;
+      grand_totals.wt      += r.billing.wt;
+      grand_totals.penalty += r.billing.penalty;
+      grand_totals.total   += r.billing.total;
+    } catch (e) {
+      if (String(e?.message || '').toLowerCase() === 'tenant not found') {
+        continue;
+      }
+      throw e;
     }
-  }
-
-  const totals_by_type = {};
-  let grand_totals = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
-
-  for (const r of results) {
-    if (r?.error) continue;
-    const t = r.meter.meter_type;
-    const b = r.totals;
-
-    if (!totals_by_type[t]) totals_by_type[t] = { base: 0, vat: 0, wt: 0, penalty: 0, total: 0 };
-
-    totals_by_type[t].base    += b.base;
-    totals_by_type[t].vat     += b.vat;
-    totals_by_type[t].wt      += b.wt;
-    totals_by_type[t].penalty += b.penalty;
-    totals_by_type[t].total   += b.total;
-
-    grand_totals.base    += b.base;
-    grand_totals.vat     += b.vat;
-    grand_totals.wt      += b.wt;
-    grand_totals.penalty += b.penalty;
-    grand_totals.total   += b.total;
   }
 
   Object.keys(totals_by_type).forEach(k => {
@@ -784,21 +788,14 @@ async function computeBillingForBuildingWithMarkup({
   return { meters: results, totals_by_type, grand_totals };
 }
 
-/* =========================
- * Exports
- * ========================= */
+
 module.exports = {
-  // standard
   computeBillingForMeter,
   computeBillingForTenant,
   computeBillingForBuilding,
-
-  // with markup
   computeBillingForMeterWithMarkup,
   computeBillingForTenantWithMarkup,
   computeBillingForBuildingWithMarkup,
-
-  // helpers
   round,
   normalizePct,
   getTwoSegmentWindow,

@@ -312,7 +312,41 @@ router.get(
       const roc = await computeROCForMeter({ meterId: meter_id, endDate });
       const rate_of_change_percent = roc?.rate_of_change ?? null;
 
-      res.json({ ...result, rate_of_change_percent, generated_at: getCurrentDateTime() });
+      const penalty_rate = (Number(penaltyRatePct) >= 1) ? Number(penaltyRatePct) / 100 : Number(penaltyRatePct) || 0;
+      const base = Number(result?.billing?.base ?? 0);
+      const vat  = Number(result?.billing?.vat ?? 0);
+      const wt   = Number(result?.billing?.wt ?? 0);
+      const vat_rate = base > 0 ? +(vat / base).toFixed(4) : null;
+      const wt_rate  = vat > 0  ? +(wt  / vat ).toFixed(4) : null;
+
+      const rates_used = {
+        utility_rate: result?.billing?.rates?.utility_rate ?? null,
+        markup_rate:  result?.billing?.rates?.markup_rate ?? null,
+        system_rate:  result?.billing?.rates?.system_rate ?? null,
+        penalty_rate
+      };
+
+      const taxes_used = {
+        vat_code: result?.tenant?.vat_code || null,
+        wt_code:  result?.tenant?.wt_code  || null,
+        vat_rate,
+        wt_rate
+      };
+
+      const consumption_breakdown = {
+        previous_month_units: roc?.previous_consumption ?? null,
+        current_month_units:  roc?.current_consumption ?? (result?.billing?.consumption ?? null),
+        rate_of_change_percent
+      };
+
+      res.json({
+        ...result,
+        rate_of_change_percent,
+        rates_used,
+        taxes_used,
+        consumption_breakdown,
+        generated_at: getCurrentDateTime()
+      });
     } catch (err) {
       console.error('Billing (meter) error:', err);
       res.status(err.status || 500).json({ error: err.message });
@@ -348,7 +382,41 @@ router.get(
       const roc = await computeROCForMeter({ meterId: meter_id, endDate });
       const rate_of_change_percent = roc?.rate_of_change ?? null;
 
-      res.json({ ...result, rate_of_change_percent, generated_at: getCurrentDateTime() });
+      const penalty_rate = (Number(penaltyRatePct) >= 1) ? Number(penaltyRatePct) / 100 : Number(penaltyRatePct) || 0;
+      const base = Number(result?.billing?.base ?? 0);
+      const vat  = Number(result?.billing?.vat ?? 0);
+      const wt   = Number(result?.billing?.wt ?? 0);
+      const vat_rate = base > 0 ? +(vat / base).toFixed(4) : null;
+      const wt_rate  = vat > 0  ? +(wt  / vat ).toFixed(4) : null;
+
+      const rates_used = {
+        utility_rate: result?.billing?.rates?.utility_rate ?? null,
+        markup_rate:  result?.billing?.rates?.markup_rate ?? null,
+        system_rate:  result?.billing?.rates?.system_rate ?? null,
+        penalty_rate
+      };
+
+      const taxes_used = {
+        vat_code: result?.tenant?.vat_code || null,
+        wt_code:  result?.tenant?.wt_code  || null,
+        vat_rate,
+        wt_rate
+      };
+
+      const consumption_breakdown = {
+        previous_month_units: roc?.previous_consumption ?? null,
+        current_month_units:  roc?.current_consumption ?? (result?.billing?.consumption ?? null),
+        rate_of_change_percent
+      };
+
+      res.json({
+        ...result,
+        rate_of_change_percent,
+        rates_used,
+        taxes_used,
+        consumption_breakdown,
+        generated_at: getCurrentDateTime()
+      });
     } catch (err) {
       console.error('Billing (meter + markup) error:', err);
       res.status(err.status || 500).json({ error: err.message });
