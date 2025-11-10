@@ -2,203 +2,190 @@
 'use strict';
 
 const { Op } = require('sequelize');
-
-// Models (used by compute + helpers)
 const Reading  = require('../models/Reading');
 const Meter    = require('../models/Meter');
 const Stall    = require('../models/Stall');
 const Building = require('../models/Building');
 
-/* ============ Error helper ============ */
-function sendErr(res, err, context = 'ROC error') {
-  const status = (err && err.status) || 500;
-  const msg =
-    (typeof err?.message === 'string' && err.message.trim()) ? err.message :
-    (typeof err === 'string' && err.trim()) ? err :
-    'Internal Server Error';
-  console.error(`${context}:`, err?.stack || err);
-  return res.status(status).json({ error: msg });
+/* =========================
+ * Basic utilities
+ * =======================*/
+const isYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s));
+const fromYMD = (s) => new Date(s + 'T00:00:00Z');
+const ymd     = (d) => d.toISOString().slice(0, 10);
+const ONE_DAY = 24 * 60 * 60 * 1000;
+const addDays = (d, n) => new Date(d.getTime() + n * ONE_DAY);
+const round   = (n, d = 2) => {
+  const f = 10 ** d, x = Number(n);
+  return Number.isFinite(x) ? Math.round(x * f) / f : 0;
+};
+
+// month span helpers (UTC-safe)
+const dtUTC = (y,m0,d) => new Date(Date.UTC(y, m0, d));
+function monthSpanFor(dateStr, monthsBack = 0) {
+  const d = new Date(dateStr + 'T00:00:00Z');
+  const Y  = d.getUTCFullYear();
+  const M0 = d.getUTCMonth() - monthsBack;
+  const spanStart = dtUTC(Y, M0, 1);
+  const spanEnd   = dtUTC(Y, M0 + 1, 0); // last day of target month
+  return { start: ymd(spanStart), end: ymd(spanEnd), month: ymd(spanStart).slice(0,7) };
 }
 
-/* ============ Pure helpers (no DB) ============ */
-const LPG_MIN_CON = 1;
-
-function round(n, d = 2) {
-  const f = Math.pow(10, d);
-  return Math.round((Number(n) || 0) * f) / f;
-}
-
-function ymd(d) {
-  const y = d.getUTCFullYear();
-  const m = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const day = String(d.getUTCDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
-}
-
-function isYMD(s) { return /^\d{4}-\d{2}-\d{2}$/.test(String(s)); }
-
-/**
- * HYBRID period calculator (matches your Excel):
- *  - Current: 1st day of end month .. endDate (inclusive)
- *  - Previous: full previous calendar month
- *  - Pre-previous: full month before previous
- */
-function getPeriodStrings(endDateStr) {
-  if (!isYMD(endDateStr)) {
-    const err = new Error('Invalid end_date format. Use YYYY-MM-DD.');
-    err.status = 400;
-    throw err;
+function ensureValidRange(startDate, endDate) {
+  if (!isYMD(startDate) || !isYMD(endDate)) {
+    const err = new Error('Invalid date(s). Use YYYY-MM-DD for both period-start and period-end.'); err.status = 400; throw err;
   }
-
-  const end = new Date(endDateStr + 'T00:00:00Z');
-
-  const firstOfMonth = (y, m) => new Date(Date.UTC(y, m, 1));
-  const lastOfMonth  = (y, m) => new Date(Date.UTC(y, m + 1, 1) - 24 * 60 * 60 * 1000);
-
-  const y = end.getUTCFullYear();
-  const m = end.getUTCMonth();
-
-  // Current: 1st of end-month .. endDate
-  const currStart = firstOfMonth(y, m);
-  const currEnd   = end;
-
-  // Previous: full previous month
-  const prevYear  = (m === 0) ? y - 1 : y;
-  const prevMonth = (m === 0) ? 11 : m - 1;
-  const prevStart = firstOfMonth(prevYear, prevMonth);
-  const prevEnd   = lastOfMonth(prevYear, prevMonth);
-
-  // Pre-previous: full month before previous
-  const pprevYear  = (prevMonth === 0) ? prevYear - 1 : prevYear;
-  const pprevMonth = (prevMonth === 0) ? 11 : prevMonth - 1;
-  const prePrevStart = firstOfMonth(pprevYear, pprevMonth);
-  const prePrevEnd   = lastOfMonth(pprevYear, pprevMonth);
-
-  return {
-    curr:    { start: ymd(currStart),    end: ymd(currEnd) },
-    prev:    { start: ymd(prevStart),    end: ymd(prevEnd) },
-    preprev: { start: ymd(prePrevStart), end: ymd(prePrevEnd) },
-  };
+  const s = fromYMD(startDate);
+  const e = fromYMD(endDate);
+  if (e < s) { const err = new Error('period-end must be on or after period-start'); err.status = 400; throw err; }
+  return { start: ymd(s), end: ymd(e), days: Math.floor((e - s) / ONE_DAY) + 1 };
 }
 
-/**
- * DISPLAY-ONLY rolling windows for the JSON output:
- *  - Current: end_date - 30 days .. end_date (inclusive)
- *  - Previous: the 31-day block immediately before current
- */
-function getDisplayRollingPeriods(endDateStr, windowDays = 31) {
-  if (!isYMD(endDateStr)) {
-    const err = new Error('Invalid end_date format. Use YYYY-MM-DD.');
-    err.status = 400;
-    throw err;
+/** Previous window with the same length, immediately before {start,end}. */
+function previousWindowSameLength(startDate, endDate) {
+  const { start, end, days } = ensureValidRange(startDate, endDate);
+  const s = fromYMD(start);
+  const prevEnd   = addDays(s, -1);
+  const prevStart = addDays(prevEnd, -(days - 1));
+  return { start: ymd(prevStart), end: ymd(prevEnd) };
+}
+
+/** Return { curr:{start,end}, prev:{start,end} } for display and compute. */
+function getDisplayForRange(startDate, endDate) {
+  const curr = ensureValidRange(startDate, endDate);
+  const prev = previousWindowSameLength(curr.start, curr.end);
+  return { curr, prev };
+}
+
+/** Split a window into N consecutive sub-windows (nearly equal size, covering all days). */
+function splitWindowIntoN(startDate, endDate, n) {
+  const { start, end, days } = ensureValidRange(startDate, endDate);
+  if (n < 1) { const err = new Error('Invalid slice count'); err.status = 400; throw err; }
+  const s = fromYMD(start);
+  const base = Math.floor(days / n);
+  let rem    = days % n;
+
+  const slices = [];
+  let cursor = s;
+  for (let i = 0; i < n; i++) {
+    const len = base + (rem > 0 ? 1 : 0);
+    if (rem > 0) rem--;
+    const sliceStart = cursor;
+    const sliceEnd   = addDays(cursor, len - 1);
+    slices.push({ start: ymd(sliceStart), end: ymd(sliceEnd) });
+    cursor = addDays(sliceEnd, 1);
   }
-  const end = new Date(endDateStr + 'T00:00:00Z');
-  const addDays = (d, n) => {
-    const t = new Date(d.getTime());
-    t.setUTCDate(t.getUTCDate() + n);
-    return t;
-  };
-
-  const currEnd   = end;
-  const currStart = addDays(end, -(windowDays - 1));
-
-  const prevEnd   = addDays(currStart, -1);
-  const prevStart = addDays(prevEnd, -(windowDays - 1));
-
-  return {
-    curr: { start: ymd(currStart), end: ymd(currEnd) },
-    prev: { start: ymd(prevStart), end: ymd(prevEnd) }
-  };
+  // Guard against drift on final slice
+  slices[slices.length - 1].end = end;
+  return slices;
 }
 
-/* ============ DB helpers ============ */
-// Latest reading within a [start, end] DATEONLY range (by lastread_date desc)
-async function getMaxReadingInPeriod(meter_id, startStr, endStr) {
+/* =========================
+ * DB helpers
+ * =======================*/
+/** Latest reading inside [start,end] by lastread_date DESC */
+async function getMaxReadingInPeriod(meter_id, start, end) {
   const row = await Reading.findOne({
-    where: {
-      meter_id,
-      lastread_date: { [Op.gte]: startStr, [Op.lte]: endStr },
-    },
+    where: { meter_id, lastread_date: { [Op.gte]: start, [Op.lte]: end } },
     order: [['lastread_date', 'DESC']],
-    raw: true,
+    attributes: ['reading_value', 'lastread_date'],
+    raw: true
   });
   return row ? { value: Number(row.reading_value) || 0, date: row.lastread_date } : null;
 }
 
-/* ============ Core compute (no auth; middlewares do that) ============ */
-function computeUnitsOnly(meterType, meterMult, building, prevIdx, currIdx) {
-  const t = String(meterType || '').toLowerCase();
-  const mult = Number(meterMult) || 1;
-  const prev = Number(prevIdx) || 0;
-  const curr = Number(currIdx) || 0;
-
-  const raw = (curr - prev) * mult;
-
+const LPG_MIN_CON = 0; // Set to 1 if you want LPG minimum consumption
+function computeUnits({ type, mult, building, prevIdx, currIdx }) {
+  const t = String(type || '').toLowerCase();
+  const raw = (Number(currIdx) - Number(prevIdx)) * (Number(mult) || 1);
   if (t === 'electric') {
     const min = Number(building.emin_con) || 0;
-    return round(raw > 0 ? raw : min);
+    return round(raw > 0 ? raw : min, 2);
   }
   if (t === 'water') {
     const min = Number(building.wmin_con) || 0;
-    return round(raw > 0 ? raw : min);
+    return round(raw > 0 ? raw : min, 2);
   }
   if (t === 'lpg') {
-    return round(raw > 0 ? raw : LPG_MIN_CON);
+    return round(raw > 0 ? raw : LPG_MIN_CON, 2);
   }
-  throw Object.assign(new Error(`Unsupported meter type: ${t}`), { status: 400 });
+  const err = new Error(`Unsupported meter type: ${t}`); err.status = 400; throw err;
 }
 
-async function computeROCForMeter({ meterId, endDate }) {
-  // Meter → Stall → Building
+/* =========================
+ * Public compute (per-meter)
+ * =======================*/
+/**
+ * Sheet-accurate ROC:
+ * - current index  = max in [startDate..endDate] (user window)
+ * - previous index = max in entire previous calendar month (relative to endDate)
+ * - anchor index   = max in entire month before previous (relative to endDate)
+ * Consumptions:
+ *   anchor_to_previous   = (prev - anchor) * mult  (with minimums)
+ *   previous_to_current  = (curr - prev)  * mult  (with minimums)
+ *   delta = previous_to_current - anchor_to_previous
+ *   rate_of_change = ceil(delta / anchor_to_previous * 100), if anchor_to_previous > 0
+ */
+async function computeROCForMeter({ meterId, startDate, endDate }) {
+  // Resolve meter → stall → building (for minimums)
   const meter = await Meter.findOne({
     where: { meter_id: meterId },
-    attributes: ['meter_id', 'meter_type', 'meter_mult', 'stall_id'],
+    attributes: ['meter_id','meter_type','meter_mult','stall_id'],
     raw: true
   });
   if (!meter) { const err = new Error('Meter not found'); err.status = 404; throw err; }
 
   const stall = await Stall.findOne({
     where: { stall_id: meter.stall_id },
-    attributes: ['stall_id', 'tenant_id', 'building_id'],
+    attributes: ['stall_id','tenant_id','building_id'],
     raw: true
   });
   if (!stall) { const err = new Error('Stall not found for this meter'); err.status = 404; throw err; }
 
   const building = await Building.findOne({
     where: { building_id: stall.building_id },
-    attributes: ['building_id', 'emin_con', 'wmin_con'],
+    attributes: ['building_id','emin_con','wmin_con'],
     raw: true
   });
   if (!building) { const err = new Error('Building configuration not found'); err.status = 400; throw err; }
 
-  const periods = getPeriodStrings(endDate);
+  // Windows
+  const current  = ensureValidRange(startDate, endDate);
+  const previous = monthSpanFor(endDate, 1);
+  const anchor   = monthSpanFor(endDate, 2);
 
-  const [currMax, prevMax, prePrevMax] = await Promise.all([
-    getMaxReadingInPeriod(meterId, periods.curr.start,    periods.curr.end),
-    getMaxReadingInPeriod(meterId, periods.prev.start,    periods.prev.end),
-    getMaxReadingInPeriod(meterId, periods.preprev.start, periods.preprev.end),
+  // Max indices in each window
+  const [currMax, prevMax, anchorMax] = await Promise.all([
+    getMaxReadingInPeriod(meterId, current.start,  current.end),
+    getMaxReadingInPeriod(meterId, previous.start, previous.end),
+    getMaxReadingInPeriod(meterId, anchor.start,   anchor.end),
   ]);
 
-  if (!currMax || !prevMax) {
+  if (!currMax || !prevMax || !anchorMax) {
     const err = new Error(
-      `Insufficient readings to compute current period. Need data in ${periods.curr.start}..${periods.curr.end} and ${periods.prev.start}..${periods.prev.end}.`
+      `Insufficient readings: need maxima in ` +
+      `[${anchor.start}..${anchor.end}], ` +
+      `[${previous.start}..${previous.end}], ` +
+      `and [${current.start}..${current.end}].`
     );
-    err.status = 400;
-    throw err;
+    err.status = 400; throw err;
   }
 
-  const unitsNow = computeUnitsOnly(meter.meter_type, meter.meter_mult, building, prevMax.value, currMax.value);
+  // Consumptions per spec (with minimums)
+  const anchor_to_previous = computeUnits({
+    type: meter.meter_type, mult: meter.meter_mult, building,
+    prevIdx: anchorMax.value, currIdx: prevMax.value
+  });
 
-  let unitsPrev = null;
-  let roc = null;
-  if (prePrevMax && prevMax) {
-    unitsPrev = computeUnitsOnly(meter.meter_type, meter.meter_mult, building, prePrevMax.value, prevMax.value);
-    if (unitsPrev > 0) {
-      roc = Math.ceil(((unitsNow - unitsPrev) / unitsPrev) * 100);
-    }
-  }
+  const previous_to_current = computeUnits({
+    type: meter.meter_type, mult: meter.meter_mult, building,
+    prevIdx: prevMax.value, currIdx: currMax.value
+  });
 
-  const display = getDisplayRollingPeriods(endDate);
+  const delta = Number(previous_to_current) - Number(anchor_to_previous);
+  const rate_of_change = anchor_to_previous > 0
+    ? Math.ceil((delta / anchor_to_previous) * 100)
+    : null;
 
   return {
     meter_id: meter.meter_id,
@@ -206,21 +193,42 @@ async function computeROCForMeter({ meterId, endDate }) {
     tenant_id: stall.tenant_id || null,
     building_id: stall.building_id,
     meter_type: String(meter.meter_type || '').toLowerCase(),
+
+    // Windows used
     period: {
-      current:  { start: display.curr.start,  end: display.curr.end },
-      previous: { start: display.prev.start,  end: display.prev.end }
+      current:  { start: current.start,  end: current.end },
+      previous: { start: previous.start, end: previous.end, month: previous.month },
+      anchor:   { start: anchor.start,   end: anchor.end,   month: anchor.month }
     },
+
+    // All three indices (explicit)
     indices: {
-      prev_index: round(prevMax.value, 2),
-      curr_index: round(currMax.value, 2)
+      anchor_index:   round(anchorMax.value, 2),
+      previous_index: round(prevMax.value, 2),
+      current_index:  round(currMax.value, 2)
     },
-    current_consumption: unitsNow,
-    previous_consumption: unitsPrev,
-    rate_of_change: roc
+
+    // For backwards compatibility (if anything relies on these)
+    prev_index: round(prevMax.value, 2),
+    curr_index: round(currMax.value, 2),
+
+    // All three consumptions (explicit)
+    consumptions: {
+      anchor_to_previous,   // (Prev - Anchor) * Mult  (min applied per type)
+      previous_to_current,  // (Curr - Prev)   * Mult  (min applied per type)
+      delta                 // previous_to_current - anchor_to_previous
+    },
+
+    // Legacy fields mirroring the current behavior
+    current_consumption:  previous_to_current,
+    previous_consumption: anchor_to_previous,
+    rate_of_change
   };
 }
 
-/* ============ Indirect building resolver for record checks ============ */
+/* =========================
+ * Building-resolver for record checks
+ * =======================*/
 async function getBuildingIdForRequest(req) {
   const meterId = req.params?.meter_id || req.params?.id || req.body?.meter_id;
   if (!meterId) return null;
@@ -230,16 +238,20 @@ async function getBuildingIdForRequest(req) {
   return stall?.building_id || null;
 }
 
+/* =========================
+ * Export
+ * =======================*/
 module.exports = {
-  // helpers
-  sendErr,
+  // Validation + window helpers
   isYMD,
-  getPeriodStrings,
-  getDisplayRollingPeriods,
-  // core compute
+  ensureValidRange,
+  previousWindowSameLength,
+  getDisplayForRange,
+  splitWindowIntoN,
+  // Core compute
   computeROCForMeter,
-  // record-building resolver
+  // Record-building resolver
   getBuildingIdForRequest,
-  // expose if you want to unit test them individually
-  __testing: { round, ymd, getMaxReadingInPeriod }
+  // DB helper (useful for comparison endpoints)
+  getMaxReadingInPeriod
 };
