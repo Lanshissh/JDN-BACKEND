@@ -175,8 +175,27 @@ router.post('/',
  * - operator: only if meter is under their building; if moving to a new stall, that stall must also be under their building
  * - if meter_type changes and meter_mult not provided, assign default (water->93 else 1)
  */
-router.put('/:id',
+router.put(
+  '/:id',
   authorizeRole('admin', 'operator'),
+  // Populate req.restrictToBuildingIds (null for admin, string[] for operators)
+  attachBuildingScope(),
+  // Authorize the CURRENT meter’s building via its stall -> building
+  enforceRecordBuilding(async (req) => {
+    const m = await Meter.findOne({
+      where: { meter_id: req.params.id },
+      attributes: ['meter_id', 'stall_id'],
+      raw: true
+    });
+    if (!m) return null; // -> middleware will 400/404 appropriately
+
+    const s = await Stall.findOne({
+      where: { stall_id: m.stall_id },
+      attributes: ['building_id'],
+      raw: true
+    });
+    return s?.building_id; // undefined/null -> treated as unresolved
+  }),
   async (req, res) => {
     const meterId = req.params.id;
     let { meter_type, meter_sn, stall_id, meter_status, meter_mult } = req.body || {};
@@ -185,33 +204,31 @@ router.put('/:id',
       const meter = await Meter.findOne({ where: { meter_id: meterId } });
       if (!meter) return res.status(404).json({ error: 'Meter not found' });
 
-      const isAdmin = (req.user?.user_level || '').toLowerCase() === 'admin';
-
-      // operator building scope on existing meter
-      if (!isAdmin) {
-        const currStall = await Stall.findOne({
-          where: { stall_id: meter.stall_id },
-          attributes: ['building_id'],
+      // If changing stall, ensure it exists and (if operator) is within their buildings
+      if (stall_id && stall_id !== meter.stall_id) {
+        const target = await Stall.findOne({
+          where: { stall_id },
+          attributes: ['stall_id', 'building_id'],
           raw: true
         });
-        if (!currStall || currStall.building_id !== req.user.building_id) {
-          return res.status(403).json({ error: 'No access: Meter not under your assigned building.' });
+        if (!target) {
+          return res.status(400).json({ error: 'Invalid stall_id: Stall does not exist.' });
+        }
+        // Operators have req.restrictToBuildingIds as string[]; admins have null (skip check)
+        if (Array.isArray(req.restrictToBuildingIds)) {
+          const allowed = req.restrictToBuildingIds.map(String);
+          if (!allowed.includes(String(target.building_id))) {
+            return res.status(403).json({ error: 'No access: Target stall not under your building(s).' });
+          }
         }
       }
 
-      // if changing stall, validate target stall + scope
-      if (stall_id && stall_id !== meter.stall_id) {
-        const target = await Stall.findOne({ where: { stall_id }, attributes: ['building_id'], raw: true });
-        if (!target) return res.status(400).json({ error: 'Invalid stall_id: Stall does not exist.' });
-        if (!isAdmin && target.building_id !== req.user.building_id) {
-          return res.status(403).json({ error: 'No access: Target stall not under your building.' });
-        }
-      }
-
-      // unique meter_sn if changed
+      // Ensure unique meter_sn when changed
       if (meter_sn && meter_sn !== meter.meter_sn) {
         const exists = await Meter.findOne({
-          where: { meter_sn, meter_id: { [Op.ne]: meterId } }
+          where: { meter_sn, meter_id: { [Op.ne]: meterId } },
+          attributes: ['meter_id'],
+          raw: true
         });
         if (exists) return res.status(409).json({ error: 'meter_sn already exists' });
       }
@@ -230,7 +247,7 @@ router.put('/:id',
         }
       }
 
-      // derive final multiplier
+      // Derive final multiplier
       let finalMult = (meter_mult !== undefined) ? meter_mult : meter.meter_mult;
       if (meter_mult !== undefined) {
         const asNum = Number(meter_mult);
@@ -244,13 +261,13 @@ router.put('/:id',
       }
 
       await meter.update({
-        meter_type:  meter_type  ?? meter.meter_type,
-        meter_sn:    meter_sn    ?? meter.meter_sn,
-        stall_id:    stall_id    ?? meter.stall_id,
-        meter_status:meter_status?? meter.meter_status,
-        meter_mult:  finalMult,
-        last_updated: getCurrentDateTime(),
-        updated_by:   req.user.user_fullname
+        meter_type:    meter_type    ?? meter.meter_type,
+        meter_sn:      meter_sn      ?? meter.meter_sn,
+        stall_id:      stall_id      ?? meter.stall_id,
+        meter_status:  meter_status  ?? meter.meter_status,
+        meter_mult:    finalMult,
+        last_updated:  getCurrentDateTime(),
+        updated_by:    req.user?.user_fullname || 'system'
       });
 
       res.json({ message: `Meter with ID ${meterId} updated successfully` });

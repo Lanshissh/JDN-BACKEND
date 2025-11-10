@@ -33,11 +33,15 @@ function monthSpanFor(dateStr, monthsBack = 0) {
 
 function ensureValidRange(startDate, endDate) {
   if (!isYMD(startDate) || !isYMD(endDate)) {
-    const err = new Error('Invalid date(s). Use YYYY-MM-DD for both period-start and period-end.'); err.status = 400; throw err;
+    const err = new Error('Invalid date(s). Use YYYY-MM-DD for both period-start and period-end.');
+    err.status = 400; throw err;
   }
   const s = fromYMD(startDate);
   const e = fromYMD(endDate);
-  if (e < s) { const err = new Error('period-end must be on or after period-start'); err.status = 400; throw err; }
+  if (e < s) {
+    const err = new Error('period-end must be on or after period-start');
+    err.status = 400; throw err;
+  }
   return { start: ymd(s), end: ymd(e), days: Math.floor((e - s) / ONE_DAY) + 1 };
 }
 
@@ -113,19 +117,8 @@ function computeUnits({ type, mult, building, prevIdx, currIdx }) {
 }
 
 /* =========================
- * Public compute (per-meter)
+ * PER-METER ROC (3 indices, 2 consumptions — no delta)
  * =======================*/
-/**
- * Sheet-accurate ROC:
- * - current index  = max in [startDate..endDate] (user window)
- * - previous index = max in entire previous calendar month (relative to endDate)
- * - anchor index   = max in entire month before previous (relative to endDate)
- * Consumptions:
- *   anchor_to_previous   = (prev - anchor) * mult  (with minimums)
- *   previous_to_current  = (curr - prev)  * mult  (with minimums)
- *   delta = previous_to_current - anchor_to_previous
- *   rate_of_change = ceil(delta / anchor_to_previous * 100), if anchor_to_previous > 0
- */
 async function computeROCForMeter({ meterId, startDate, endDate }) {
   // Resolve meter → stall → building (for minimums)
   const meter = await Meter.findOne({
@@ -154,7 +147,7 @@ async function computeROCForMeter({ meterId, startDate, endDate }) {
   const previous = monthSpanFor(endDate, 1);
   const anchor   = monthSpanFor(endDate, 2);
 
-  // Max indices in each window
+  // Max indices
   const [currMax, prevMax, anchorMax] = await Promise.all([
     getMaxReadingInPeriod(meterId, current.start,  current.end),
     getMaxReadingInPeriod(meterId, previous.start, previous.end),
@@ -171,7 +164,7 @@ async function computeROCForMeter({ meterId, startDate, endDate }) {
     err.status = 400; throw err;
   }
 
-  // Consumptions per spec (with minimums)
+  // Consumptions (with minimums)
   const anchor_to_previous = computeUnits({
     type: meter.meter_type, mult: meter.meter_mult, building,
     prevIdx: anchorMax.value, currIdx: prevMax.value
@@ -182,9 +175,9 @@ async function computeROCForMeter({ meterId, startDate, endDate }) {
     prevIdx: prevMax.value, currIdx: currMax.value
   });
 
-  const delta = Number(previous_to_current) - Number(anchor_to_previous);
+  // Rate of change computed without exposing delta
   const rate_of_change = anchor_to_previous > 0
-    ? Math.ceil((delta / anchor_to_previous) * 100)
+    ? Math.ceil(((previous_to_current - anchor_to_previous) / anchor_to_previous) * 100)
     : null;
 
   return {
@@ -194,36 +187,95 @@ async function computeROCForMeter({ meterId, startDate, endDate }) {
     building_id: stall.building_id,
     meter_type: String(meter.meter_type || '').toLowerCase(),
 
-    // Windows used
     period: {
       current:  { start: current.start,  end: current.end },
       previous: { start: previous.start, end: previous.end, month: previous.month },
       anchor:   { start: anchor.start,   end: anchor.end,   month: anchor.month }
     },
 
-    // All three indices (explicit)
     indices: {
       anchor_index:   round(anchorMax.value, 2),
       previous_index: round(prevMax.value, 2),
       current_index:  round(currMax.value, 2)
     },
 
-    // For backwards compatibility (if anything relies on these)
+    // For backwards compatibility (if anything still reads these)
     prev_index: round(prevMax.value, 2),
     curr_index: round(currMax.value, 2),
 
-    // All three consumptions (explicit)
+    // Only two consumptions now
     consumptions: {
-      anchor_to_previous,   // (Prev - Anchor) * Mult  (min applied per type)
-      previous_to_current,  // (Curr - Prev)   * Mult  (min applied per type)
-      delta                 // previous_to_current - anchor_to_previous
+      anchor_to_previous,
+      previous_to_current
     },
 
-    // Legacy fields mirroring the current behavior
+    // Legacy aggregate fields mirroring the two consumptions
     current_consumption:  previous_to_current,
     previous_consumption: anchor_to_previous,
     rate_of_change
   };
+}
+
+/* =========================
+ * PER-TENANT HELPERS (no delta)
+ * =======================*/
+function getTenantPeriods(startDate, endDate) {
+  const current  = ensureValidRange(startDate, endDate);
+  const previous = monthSpanFor(endDate, 1);
+  const anchor   = monthSpanFor(endDate, 2);
+  return { current, previous, anchor };
+}
+
+function groupMetersByType(perMeterResults) {
+  const byType = new Map();
+
+  for (const r of perMeterResults) {
+    const type = String(r.meter_type || '').toLowerCase();
+    if (!byType.has(type)) {
+      byType.set(type, {
+        meter_type: type,
+        meters: [],
+        totals: {
+          anchor_to_previous: 0,
+          previous_to_current: 0,
+          current_consumption: 0,
+          previous_consumption: 0,
+          rate_of_change: null
+        }
+      });
+    }
+    const g = byType.get(type);
+    g.meters.push(r);
+
+    const a2p = Number(r?.consumptions?.anchor_to_previous)   || 0;
+    const p2c = Number(r?.consumptions?.previous_to_current)  || 0;
+
+    g.totals.anchor_to_previous   += a2p;
+    g.totals.previous_to_current  += p2c;
+  }
+
+  // finalize rounding & ROC (no delta exposed)
+  for (const g of byType.values()) {
+    g.totals.anchor_to_previous   = Math.round(g.totals.anchor_to_previous   * 100) / 100;
+    g.totals.previous_to_current  = Math.round(g.totals.previous_to_current  * 100) / 100;
+
+    // expose legacy names too
+    g.totals.current_consumption  = g.totals.previous_to_current;
+    g.totals.previous_consumption = g.totals.anchor_to_previous;
+
+    g.totals.rate_of_change =
+      g.totals.anchor_to_previous > 0
+        ? Math.ceil(((g.totals.previous_to_current - g.totals.anchor_to_previous) / g.totals.anchor_to_previous) * 100)
+        : null;
+  }
+
+  // order: electric, water, lpg, then others
+  const order = ['electric', 'water', 'lpg'];
+  return Array.from(byType.values()).sort((a, b) => {
+    const ia = order.indexOf(a.meter_type);
+    const ib = order.indexOf(b.meter_type);
+    return (ia === -1 ? 999 : ia) - (ib === -1 ? 999 : ib);
+  });
 }
 
 /* =========================
@@ -239,7 +291,7 @@ async function getBuildingIdForRequest(req) {
 }
 
 /* =========================
- * Export
+ * Exports
  * =======================*/
 module.exports = {
   // Validation + window helpers
@@ -248,10 +300,19 @@ module.exports = {
   previousWindowSameLength,
   getDisplayForRange,
   splitWindowIntoN,
+  monthSpanFor,
+
   // Core compute
   computeROCForMeter,
+  computeUnits,
+
+  // Tenant helpers (no delta)
+  getTenantPeriods,
+  groupMetersByType,
+
   // Record-building resolver
   getBuildingIdForRequest,
-  // DB helper (useful for comparison endpoints)
+
+  // DB helper
   getMaxReadingInPeriod
 };
