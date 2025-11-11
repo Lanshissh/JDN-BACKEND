@@ -65,21 +65,24 @@ async function resolveBuildingFromParam(req) {
  * BUILDING (standard) — grouped by tenant, ROC only per meter (clean output)
  * ========================================================================== */
 router.get(
-  '/buildings/:building_id/period-end/:endDate',
+  '/buildings/:building_id/period-start/:startDate/period-end/:endDate',
   authorizeRole('admin', 'operator', 'biller'),
   attachBuildingScope(),
   enforceRecordBuilding(resolveBuildingFromParam),
   async (req, res) => {
     try {
-      const { building_id, endDate } = req.params;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-        return res.status(400).json({ error: 'Invalid endDate. Use YYYY-MM-DD.' });
+      const { building_id, startDate, endDate } = req.params;
+
+      const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+      if (!isYMD(startDate) || !isYMD(endDate)) {
+        return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
       const penaltyRatePct = Number(req.query.penalty_rate) || 0;
 
       const { meters } = await computeBillingForBuilding({
         buildingId: building_id,
+        startDate,
         endDate,
         penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
@@ -93,13 +96,17 @@ router.get(
         const meterSN    = entry?.meter?.meter_sn ?? null;
         const mult       = Number(entry?.meter?.meter_mult ?? 1);
         const stallNo    = entry?.stall?.stall_id ?? null;
+        const stallSn = entry?.stall?.stall_sn ?? null;
         const tenantId   = entry?.tenant?.tenant_id ?? null;
         const tenantName = entry?.tenant?.tenant_name ?? null;
+        const tenantSn = entry?.tenant?.tenant_sn ?? null;
+        
 
         let rate_of_change_pct = null;
         let prev_consumed_kwh  = null;
         try {
-          const roc = await computeROCForMeter({ meterId, endDate });
+          // Use the same custom window for ROC
+          const roc = await computeROCForMeter({ meterId, startDate, endDate });
           rate_of_change_pct = roc?.rate_of_change ?? null;
           prev_consumed_kwh  = roc?.previous_consumption ?? null;
         } catch {}
@@ -116,7 +123,9 @@ router.get(
 
         rows.push({
           stall_no: stallNo,
+          stall_sn: stallSn,
           tenant_id: tenantId,
+          tenant_sn: tenantSn,
           tenant_name: tenantName,
           meter_no: meterSN,
           meter_id: meterId,
@@ -160,7 +169,7 @@ router.get(
 
       res.json({
         building_id,
-        end_date: endDate,
+        period: { start: startDate, end: endDate },
         tenants,
         totals,
         generated_at: getCurrentDateTime(),
@@ -176,21 +185,23 @@ router.get(
  * BUILDING (with markup) — grouped by tenant; show system_rate & markup_rate
  * ========================================================================== */
 router.get(
-  '/with-markup/buildings/:building_id/period-end/:endDate',
+  '/with-markup/buildings/:building_id/period-start/:startDate/period-end/:endDate',
   authorizeRole('admin', 'operator', 'biller'),
   attachBuildingScope(),
   enforceRecordBuilding(resolveBuildingFromParam),
   async (req, res) => {
     try {
-      const { building_id, endDate } = req.params;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-        return res.status(400).json({ error: 'Invalid endDate. Use YYYY-MM-DD.' });
+      const { building_id, startDate, endDate } = req.params;
+      const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+      if (!isYMD(startDate) || !isYMD(endDate)) {
+        return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
       const penaltyRatePct = Number(req.query.penalty_rate) || 0;
 
       const { meters } = await computeBillingForBuildingWithMarkup({
         buildingId: building_id,
+        startDate,
         endDate,
         penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
@@ -204,13 +215,16 @@ router.get(
         const meterSN    = entry?.meter?.meter_sn ?? null;
         const mult       = Number(entry?.meter?.meter_mult ?? 1);
         const stallNo    = entry?.stall?.stall_id ?? null;
+        const stallSN    = entry?.stall?.stall_sn ?? null;           // <- NEW
         const tenantId   = entry?.tenant?.tenant_id ?? null;
+        const tenantSN   = entry?.tenant?.tenant_sn ?? null;         // <- NEW
         const tenantName = entry?.tenant?.tenant_name ?? null;
 
         let rate_of_change_pct = null;
         let prev_consumed_kwh  = null;
         try {
-          const roc = await computeROCForMeter({ meterId, endDate });
+          // mirror the same window for ROC
+          const roc = await computeROCForMeter({ meterId, startDate, endDate });
           rate_of_change_pct = roc?.rate_of_change ?? null;
           prev_consumed_kwh  = roc?.previous_consumption ?? null;
         } catch {}
@@ -229,7 +243,9 @@ router.get(
 
         rows.push({
           stall_no: stallNo,
+          stall_sn: stallSN,               // <- NEW
           tenant_id: tenantId,
+          tenant_sn: tenantSN,             // <- NEW
           tenant_name: tenantName,
           meter_no: meterSN,
           meter_id: meterId,
@@ -239,7 +255,7 @@ router.get(
           consumed_kwh: consumed,
           utility_rate: utilityRate,
           markup_rate: markupRate,
-          system_rate: systemRate, // = utility_rate + markup_rate
+          system_rate: systemRate,
           vat_rate: vatRate,
           total_amount: totalAmt,
           prev_consumed_kwh: prev_consumed_kwh,
@@ -251,11 +267,17 @@ router.get(
         });
       }
 
+      // group by tenant (include tenant_sn)
       const tenantsMap = new Map();
       for (const r of rows) {
         const tkey = `${r.tenant_name ?? 'UNKNOWN'}::${r.tenant_id ?? 'NA'}`;
         if (!tenantsMap.has(tkey)) {
-          tenantsMap.set(tkey, { tenant_id: r.tenant_id ?? null, tenant_name: r.tenant_name ?? null, rows: [] });
+          tenantsMap.set(tkey, {
+            tenant_id: r.tenant_id ?? null,
+            tenant_sn: r.tenant_sn ?? null,   // <- NEW
+            tenant_name: r.tenant_name ?? null,
+            rows: []
+          });
         }
         tenantsMap.get(tkey).rows.push(r);
       }
@@ -272,7 +294,7 @@ router.get(
 
       res.json({
         building_id,
-        end_date: endDate,
+        period: { start: startDate, end: endDate },
         tenants,
         totals,
         generated_at: getCurrentDateTime(),
@@ -435,35 +457,38 @@ router.get(
 
 
 /* =============================================================================
- * TENANT (with markup)
+ * TENANT (standard, no markup) — requires period-start + period-end
  * ========================================================================== */
 router.get(
-  '/with-markup/tenants/:tenant_id/period-end/:endDate',
+  '/tenants/:tenant_id/period-start/:startDate/period-end/:endDate',
   authorizeRole('admin', 'operator', 'biller'),
   attachBuildingScope(),
   async (req, res) => {
     try {
-      const { tenant_id, endDate } = req.params;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-        return res.status(400).json({ error: 'Invalid endDate. Use YYYY-MM-DD.' });
+      const { tenant_id, startDate, endDate } = req.params;
+      const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+      if (!isYMD(startDate) || !isYMD(endDate)) {
+        return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
       const penaltyRatePct = Number(req.query.penalty_rate) || 0;
 
-      const { meters, totals_by_type, grand_totals } = await computeBillingForTenantWithMarkup({
+      const { meters, totals_by_type, grand_totals } = await computeBillingForTenant({
         tenantId: tenant_id,
+        startDate,
         endDate,
         penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
+      // Attach ROC per meter using the SAME window (best-effort)
       const metersWithROC = [];
       for (const entry of meters) {
         if (entry?.error) { metersWithROC.push(entry); continue; }
         const meterId = entry?.meter?.meter_id;
         let rate_of_change_percent = null;
         try {
-          const roc = await computeROCForMeter({ meterId, endDate });
+          const roc = await computeROCForMeter({ meterId, startDate, endDate });
           rate_of_change_percent = roc?.rate_of_change ?? null;
         } catch { rate_of_change_percent = null; }
         metersWithROC.push({ ...entry, rate_of_change_percent });
@@ -471,7 +496,63 @@ router.get(
 
       res.json({
         tenant_id,
-        end_date: endDate,
+        period: { start: startDate, end: endDate },
+        meters: metersWithROC,
+        totals_by_type,
+        grand_totals,
+        generated_at: getCurrentDateTime(),
+      });
+    } catch (err) {
+      console.error('Billing (tenant, no markup) error:', err);
+      res.status(err.status || 500).json({ error: err.message });
+    }
+  }
+);
+
+
+
+/* =============================================================================
+ * TENANT (with markup) — requires period-start + period-end
+ * ========================================================================== */
+router.get(
+  '/with-markup/tenants/:tenant_id/period-start/:startDate/period-end/:endDate',
+  authorizeRole('admin', 'operator', 'biller'),
+  attachBuildingScope(),
+  async (req, res) => {
+    try {
+      const { tenant_id, startDate, endDate } = req.params;
+
+      const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+      if (!isYMD(startDate) || !isYMD(endDate)) {
+        return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
+      }
+
+      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
+
+      const { meters, totals_by_type, grand_totals } = await computeBillingForTenantWithMarkup({
+        tenantId: tenant_id,
+        startDate,
+        endDate,
+        penaltyRatePct,
+        restrictToBuildingIds: req.restrictToBuildingIds ?? null,
+      });
+
+      // attach ROC per meter using the same window (best-effort)
+      const metersWithROC = [];
+      for (const entry of meters) {
+        if (entry?.error) { metersWithROC.push(entry); continue; }
+        const meterId = entry?.meter?.meter_id;
+        let rate_of_change_percent = null;
+        try {
+          const roc = await computeROCForMeter({ meterId, startDate, endDate });
+          rate_of_change_percent = roc?.rate_of_change ?? null;
+        } catch { rate_of_change_percent = null; }
+        metersWithROC.push({ ...entry, rate_of_change_percent });
+      }
+
+      res.json({
+        tenant_id,
+        period: { start: startDate, end: endDate },
         meters: metersWithROC,
         totals_by_type,
         grand_totals,
