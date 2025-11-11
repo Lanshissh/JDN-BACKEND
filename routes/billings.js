@@ -285,39 +285,46 @@ router.get(
 );
 
 /* =============================================================================
- * METER (standard)
+ * METER (standard) — requires period-start + period-end
  * ========================================================================== */
 router.get(
-  '/meters/:meter_id/period-end/:endDate',
+  '/meters/:meter_id/period-start/:startDate/period-end/:endDate',
   authorizeRole('admin', 'operator', 'biller'),
   authorizeUtility({ roles: ['operator', 'biller'], anyOf: ['electric', 'water', 'lpg'] }),
   attachBuildingScope(),
   enforceRecordBuilding(resolveBuildingForMeter),
   async (req, res) => {
     try {
-      const { meter_id, endDate } = req.params;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-        return res.status(400).json({ error: 'Invalid endDate. Use YYYY-MM-DD.' });
+      const { meter_id, startDate, endDate } = req.params;
+
+      const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+      if (!isYMD(startDate) || !isYMD(endDate)) {
+        return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
       const penaltyRatePct = Number(req.query.penalty_rate) || 0;
 
       const result = await computeBillingForMeter({
         meterId: meter_id,
+        startDate,
         endDate,
         penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
-      const roc = await computeROCForMeter({ meterId: meter_id, endDate });
+      // keep ROC in sync with same custom window
+      const roc = await computeROCForMeter({ meterId: meter_id, startDate, endDate });
       const rate_of_change_percent = roc?.rate_of_change ?? null;
 
-      const penalty_rate = (Number(penaltyRatePct) >= 1) ? Number(penaltyRatePct) / 100 : Number(penaltyRatePct) || 0;
+      const penalty_rate = (Number(penaltyRatePct) >= 1)
+        ? Number(penaltyRatePct) / 100
+        : Number(penaltyRatePct) || 0;
+
       const base = Number(result?.billing?.base ?? 0);
       const vat  = Number(result?.billing?.vat ?? 0);
       const wt   = Number(result?.billing?.wt ?? 0);
       const vat_rate = base > 0 ? +(vat / base).toFixed(4) : null;
-      const wt_rate  = vat > 0  ? +(wt  / vat ).toFixed(4) : null;
+      const wt_rate  = vat  > 0 ? +(wt  / vat ).toFixed(4) : null;
 
       const rates_used = {
         utility_rate: result?.billing?.rates?.utility_rate ?? null,
@@ -345,6 +352,7 @@ router.get(
         rates_used,
         taxes_used,
         consumption_breakdown,
+        period: { start: startDate, end: endDate },
         generated_at: getCurrentDateTime()
       });
     } catch (err) {
@@ -354,34 +362,36 @@ router.get(
   }
 );
 
+
 /* =============================================================================
- * METER (with markup)
+ * METER (with markup) — requires start & end
  * ========================================================================== */
 router.get(
-  '/with-markup/meters/:meter_id/period-end/:endDate',
+  '/with-markup/meters/:meter_id/period-start/:startDate/period-end/:endDate',
   authorizeRole('admin', 'operator', 'biller'),
   authorizeUtility({ roles: ['operator', 'biller'], anyOf: ['electric', 'water', 'lpg'] }),
   attachBuildingScope(),
   enforceRecordBuilding(resolveBuildingForMeter),
   async (req, res) => {
     try {
-      const { meter_id, endDate } = req.params;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-        return res.status(400).json({ error: 'Invalid endDate. Use YYYY-MM-DD.' });
+      const { meter_id, startDate, endDate } = req.params;
+
+      const isYMD = (s) => /^\d{4}-\d{2}-\d{2}$/.test(String(s));
+      if (!isYMD(startDate) || !isYMD(endDate)) {
+        return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
       const penaltyRatePct = Number(req.query.penalty_rate) || 0;
 
       const result = await computeBillingForMeterWithMarkup({
         meterId: meter_id,
+        startDate,
         endDate,
         penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
-      const roc = await computeROCForMeter({ meterId: meter_id, endDate });
-      const rate_of_change_percent = roc?.rate_of_change ?? null;
-
+      // Derive UI convenience fields (same pattern you use elsewhere)
       const penalty_rate = (Number(penaltyRatePct) >= 1) ? Number(penaltyRatePct) / 100 : Number(penaltyRatePct) || 0;
       const base = Number(result?.billing?.base ?? 0);
       const vat  = Number(result?.billing?.vat ?? 0);
@@ -404,75 +414,25 @@ router.get(
       };
 
       const consumption_breakdown = {
-        previous_month_units: roc?.previous_consumption ?? null,
-        current_month_units:  roc?.current_consumption ?? (result?.billing?.consumption ?? null),
-        rate_of_change_percent
+        previous_window_units: result?.previous_units ?? null,
+        current_window_units:  result?.billing?.consumption ?? null,
+        rate_of_change_percent: result?.rate_of_change_percent ?? null
       };
 
       res.json({
         ...result,
-        rate_of_change_percent,
         rates_used,
         taxes_used,
         consumption_breakdown,
         generated_at: getCurrentDateTime()
       });
     } catch (err) {
-      console.error('Billing (meter + markup) error:', err);
+      console.error('Billing (meter + markup, ranged) error:', err);
       res.status(err.status || 500).json({ error: err.message });
     }
   }
 );
 
-/* =============================================================================
- * TENANT (standard)
- * ========================================================================== */
-router.get(
-  '/tenants/:tenant_id/period-end/:endDate',
-  authorizeRole('admin', 'operator', 'biller'),
-  attachBuildingScope(),
-  async (req, res) => {
-    try {
-      const { tenant_id, endDate } = req.params;
-      if (!/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
-        return res.status(400).json({ error: 'Invalid endDate. Use YYYY-MM-DD.' });
-      }
-
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
-      const { meters, totals_by_type, grand_totals } = await computeBillingForTenant({
-        tenantId: tenant_id,
-        endDate,
-        penaltyRatePct,
-        restrictToBuildingIds: req.restrictToBuildingIds ?? null,
-      });
-
-      const metersWithROC = [];
-      for (const entry of meters) {
-        if (entry?.error) { metersWithROC.push(entry); continue; }
-        const meterId = entry?.meter?.meter_id;
-        let rate_of_change_percent = null;
-        try {
-          const roc = await computeROCForMeter({ meterId, endDate });
-          rate_of_change_percent = roc?.rate_of_change ?? null;
-        } catch { rate_of_change_percent = null; }
-        metersWithROC.push({ ...entry, rate_of_change_percent });
-      }
-
-      res.json({
-        tenant_id,
-        end_date: endDate,
-        meters: metersWithROC,
-        totals_by_type,
-        grand_totals,
-        generated_at: getCurrentDateTime(),
-      });
-    } catch (err) {
-      console.error('Billing (tenant) error:', err);
-      res.status(err.status || 500).json({ error: err.message });
-    }
-  }
-);
 
 /* =============================================================================
  * TENANT (with markup)

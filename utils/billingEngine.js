@@ -203,9 +203,17 @@ function computeChargesByTypeWithMarkup(
   };
 }
 
+// Requires: startDate (string, YYYY-MM-DD) and endDate (string, YYYY-MM-DD)
 async function computeBillingForMeter({
-  meterId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
+  meterId, startDate, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
 }) {
+  // --- quick validators ---
+  const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (!isYMD(startDate) || !isYMD(endDate)) {
+    const e = new Error('Invalid date(s). Use YYYY-MM-DD.');
+    e.status = 400; throw e;
+  }
+
   const meter = await Meter.findOne({
     where: { meter_id: meterId },
     attributes: ['meter_id', 'meter_sn', 'meter_type', 'meter_mult', 'stall_id'],
@@ -215,7 +223,7 @@ async function computeBillingForMeter({
 
   const stall = await Stall.findOne({
     where: { stall_id: meter.stall_id },
-    attributes: ['stall_id', 'building_id', 'tenant_id'],
+    attributes: ['stall_id', 'stall_sn', 'building_id', 'tenant_id'],
     raw: true
   });
   if (!stall) { const e = new Error('Stall not found for this meter'); e.status = 404; throw e; }
@@ -223,8 +231,7 @@ async function computeBillingForMeter({
   if (Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length) {
     if (!restrictToBuildingIds.includes(String(stall.building_id))) {
       const e = new Error('No access to this record’s building');
-      e.status = 403;
-      throw e;
+      e.status = 403; throw e;
     }
   }
 
@@ -242,25 +249,44 @@ async function computeBillingForMeter({
 
   const tenant = await Tenant.findOne({
     where: { tenant_id: stall.tenant_id },
-    attributes: ['tenant_id','tenant_name','vat_code','wt_code','for_penalty'],
+    attributes: ['tenant_id','tenant_sn','tenant_name','vat_code','wt_code','for_penalty'],
     raw: true
   });
   if (!tenant) { const e = new Error('Tenant not found'); e.status = 404; throw e; }
 
-  const taxKnobs = await getTenantTaxKnobs(tenant);
+  const taxKnobs   = await getTenantTaxKnobs(tenant);
   const forPenalty = !!tenant.for_penalty;
   const penaltyRate = normalizePct(penaltyRatePct);
 
-  const indexPeriods = getPeriodStrings(endDate);
-  const [prevMax, currMax] = await Promise.all([
-    getMaxReadingInPeriod(meterId, indexPeriods.prev.start, indexPeriods.prev.end),
-    getMaxReadingInPeriod(meterId, indexPeriods.curr.start, indexPeriods.curr.end),
+  // --- build previous full calendar month (relative to endDate) + anchor month ---
+  const end = new Date(endDate + 'T00:00:00Z');
+  const firstOfMonth = (y,m) => new Date(Date.UTC(y, m, 1));
+  const lastOfMonth  = (y,m) => new Date(Date.UTC(y, m + 1, 1) - DAY_MS);
+
+  const y = end.getUTCFullYear();
+  const m = end.getUTCMonth();         // 0..11 (month of endDate)
+  const prevY = m === 0 ? y - 1 : y;
+  const prevM = m === 0 ? 11   : m - 1;
+
+  const anchorY = prevM === 0 ? prevY - 1 : prevY;
+  const anchorM = prevM === 0 ? 11        : prevM - 1;
+
+  const prevStart   = ymd(firstOfMonth(prevY,   prevM));
+  const prevEnd     = ymd(lastOfMonth (prevY,   prevM));
+  const anchorStart = ymd(firstOfMonth(anchorY, anchorM));
+  const anchorEnd   = ymd(lastOfMonth (anchorY, anchorM));
+
+  // --- indices from (previous month) and (current custom window) ---
+  const [anchorMax, prevMax, currMax] = await Promise.all([
+    getMaxReadingInPeriod(meterId, anchorStart, anchorEnd),
+    getMaxReadingInPeriod(meterId, prevStart,   prevEnd),
+    getMaxReadingInPeriod(meterId, startDate,   endDate),
   ]);
-  if (!currMax) { const e = new Error(`No readings for ${indexPeriods.curr.start}..${indexPeriods.curr.end}`); e.status = 400; throw e; }
-  if (!prevMax) { const e = new Error(`No readings for ${indexPeriods.prev.start}..${indexPeriods.prev.end}`); e.status = 400; throw e; }
+  if (!currMax) { const e = new Error(`No readings for ${startDate}..${endDate}`); e.status = 400; throw e; }
+  if (!prevMax) { const e = new Error(`No readings for ${prevStart}..${prevEnd}`); e.status = 400; throw e; }
+  if (!anchorMax) { const e = new Error(`No readings for ${anchorStart}..${anchorEnd}`); e.status = 400; throw e; }
 
-  const displayPeriods = getTwoSegmentWindow(endDate);
-
+  // --- billing (current window = prevMax → currMax) ---
   const mtype = String(meter.meter_type || '').toLowerCase();
   const mult  = Number(meter.meter_mult) || 1;
 
@@ -268,9 +294,18 @@ async function computeBillingForMeter({
     mtype, mult, building, taxKnobs, prevMax.value, currMax.value, forPenalty, penaltyRate
   );
 
-  const prevUnits = computeUnitsOnly(mtype, mult, building, prevMax.value - (mult || 1), prevMax.value);
+  // --- ROC-style prev/current units for percentage (anchor→prev, prev→curr) ---
+  const prevUnits = computeUnitsOnly(mtype, mult, building, anchorMax.value, prevMax.value);
   const currUnits = bill.consumption;
-  const rateOfChangePercent = prevUnits > 0 ? round(((currUnits - prevUnits) / prevUnits) * 100, 0) : 0;
+  const rateOfChangePercent = prevUnits > 0
+    ? Math.ceil(((currUnits - prevUnits) / prevUnits) * 100)
+    : 0;
+
+  // --- display the exact periods used ---
+  const period = {
+    previous: { start: prevStart, end: prevEnd },
+    current:  { start: startDate, end: endDate }
+  };
 
   return {
     meter: {
@@ -281,20 +316,19 @@ async function computeBillingForMeter({
     },
     stall: {
       stall_id: stall.stall_id,
+      stall_sn: stall.stall_sn,
       building_id: stall.building_id,
       tenant_id: stall.tenant_id,
     },
     tenant: {
       tenant_id: tenant.tenant_id,
+      tenant_sn: tenant.tenant_sn,
       tenant_name: tenant.tenant_name,
       vat_code: tenant.vat_code || null,
       wt_code: tenant.wt_code || null,
       for_penalty: forPenalty,
     },
-    period: {
-      previous: displayPeriods.prev,
-      current: displayPeriods.curr,
-    },
+    period,
     indices: {
       prev_index: round(prevMax.value, 2),
       curr_index: round(currMax.value, 2),
@@ -302,20 +336,36 @@ async function computeBillingForMeter({
     billing: bill,
     totals: {
       consumption: bill.consumption,
-      base: bill.base,
-      vat: bill.vat,
-      wt: bill.wt,
-      penalty: bill.penalty,
-      total: bill.total,
+      base:        bill.base,
+      vat:         bill.vat,
+      wt:          bill.wt,
+      penalty:     bill.penalty,
+      total:       bill.total,
     },
     rate_of_change_percent: rateOfChangePercent,
     generated_at: new Date().toISOString().replace('T', ' ').slice(0, 19)
   };
 }
 
+
 async function computeBillingForMeterWithMarkup({
-  meterId, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
+  meterId,
+  startDate,
+  endDate,
+  penaltyRatePct = 0,
+  restrictToBuildingIds = null
 }) {
+  // --- validate dates ---
+  const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
+  if (!isYMD(startDate) || !isYMD(endDate)) {
+    const e = new Error('Invalid date(s). Use YYYY-MM-DD.');
+    e.status = 400; throw e;
+  }
+  const s = new Date(startDate + 'T00:00:00Z');
+  const e2 = new Date(endDate   + 'T00:00:00Z');
+  if (e2 < s) { const e = new Error('endDate must be on/after startDate'); e.status = 400; throw e; }
+
+  // --- resolve records ---
   const meter = await Meter.findOne({
     where: { meter_id: meterId },
     attributes: ['meter_id', 'meter_sn', 'meter_type', 'meter_mult', 'stall_id'],
@@ -325,16 +375,14 @@ async function computeBillingForMeterWithMarkup({
 
   const stall = await Stall.findOne({
     where: { stall_id: meter.stall_id },
-    attributes: ['stall_id', 'building_id', 'tenant_id'],
+    attributes: ['stall_id', 'stall_sn', 'building_id', 'tenant_id'],
     raw: true
   });
   if (!stall) { const e = new Error('Stall not found for this meter'); e.status = 404; throw e; }
 
   if (Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length) {
     if (!restrictToBuildingIds.includes(String(stall.building_id))) {
-      const e = new Error('No access to this record’s building');
-      e.status = 403;
-      throw e;
+      const e = new Error('No access to this record’s building'); e.status = 403; throw e;
     }
   }
 
@@ -352,25 +400,31 @@ async function computeBillingForMeterWithMarkup({
 
   const tenant = await Tenant.findOne({
     where: { tenant_id: stall.tenant_id },
-    attributes: ['tenant_id','tenant_name','vat_code','wt_code','for_penalty'],
+    attributes: ['tenant_id','tenant_sn','tenant_name','vat_code','wt_code','for_penalty'],
     raw: true
   });
   if (!tenant) { const e = new Error('Tenant not found'); e.status = 404; throw e; }
 
-  const taxKnobs = await getTenantTaxKnobs(tenant);
+  const taxKnobs   = await getTenantTaxKnobs(tenant);
   const forPenalty = !!tenant.for_penalty;
   const penaltyRate = normalizePct(penaltyRatePct);
 
-  const indexPeriods = getPeriodStrings(endDate);
-  const [prevMax, currMax] = await Promise.all([
-    getMaxReadingInPeriod(meter.meter_id, indexPeriods.prev.start, indexPeriods.prev.end),
-    getMaxReadingInPeriod(meter.meter_id, indexPeriods.curr.start, indexPeriods.curr.end),
+  // --- periods: previous full calendar month of endDate + its anchor month ---
+  const { monthSpanFor, getMaxReadingInPeriod } = require('../utils/rocUtils');
+  const prev   = monthSpanFor(endDate, 1);
+  const anchor = monthSpanFor(endDate, 2);
+
+  // --- indices (latest reading within each window) ---
+  const [anchorMax, prevMax, currMax] = await Promise.all([
+    getMaxReadingInPeriod(meter.meter_id, anchor.start, anchor.end),
+    getMaxReadingInPeriod(meter.meter_id, prev.start,   prev.end),
+    getMaxReadingInPeriod(meter.meter_id, startDate,     endDate),
   ]);
-  if (!currMax) { const e = new Error(`No readings for ${indexPeriods.curr.start}..${indexPeriods.curr.end}`); e.status = 400; throw e; }
-  if (!prevMax) { const e = new Error(`No readings for ${indexPeriods.prev.start}..${indexPeriods.prev.end}`); e.status = 400; throw e; }
+  if (!currMax) { const e = new Error(`No readings for ${startDate}..${endDate}`); e.status = 400; throw e; }
+  if (!prevMax) { const e = new Error(`No readings for ${prev.start}..${prev.end}`); e.status = 400; throw e; }
+  if (!anchorMax) { const e = new Error(`No readings for ${anchor.start}..${anchor.end}`); e.status = 400; throw e; }
 
-  const displayPeriods = getTwoSegmentWindow(endDate);
-
+  // --- billing for CURRENT window (prevMax → currMax) using markup system rate ---
   const mtype = String(meter.meter_type || '').toLowerCase();
   const mult  = Number(meter.meter_mult) || 1;
 
@@ -378,10 +432,16 @@ async function computeBillingForMeterWithMarkup({
     mtype, mult, building, taxKnobs, prevMax.value, currMax.value, forPenalty, penaltyRate
   );
 
-  const prevUnits = computeUnitsOnly(mtype, mult, building, prevMax.value - (mult || 1), prevMax.value);
+  // --- ROC-style units for percentage: (anchor→prev) vs (prev→curr) ---
+  const prevUnits = computeUnitsOnly(mtype, mult, building, anchorMax.value, prevMax.value);
   const currUnits = bill.consumption;
-  const rateOfChangePercent = prevUnits > 0 ? round(((currUnits - prevUnits) / prevUnits) * 100, 0) : 0;
 
+  const rateOfChangePercent =
+    prevUnits > 0
+      ? Math.ceil(((currUnits - prevUnits) / prevUnits) * 100)
+      : 0;
+
+  // --- response ---
   return {
     meter: {
       meter_id: meter.meter_id,
@@ -391,19 +451,21 @@ async function computeBillingForMeterWithMarkup({
     },
     stall: {
       stall_id: stall.stall_id,
+      stall_sn: stall.stall_sn || null,
       building_id: stall.building_id,
       tenant_id: stall.tenant_id,
     },
     tenant: {
       tenant_id: tenant.tenant_id,
+      tenant_sn: tenant.tenant_sn || null,
       tenant_name: tenant.tenant_name,
       vat_code: tenant.vat_code || null,
       wt_code: tenant.wt_code || null,
       for_penalty: forPenalty,
     },
     period: {
-      previous: displayPeriods.prev,
-      current: displayPeriods.curr,
+      previous: { start: prev.start, end: prev.end },
+      current:  { start: startDate,  end: endDate }
     },
     indices: {
       prev_index: round(prevMax.value, 2),
@@ -412,12 +474,13 @@ async function computeBillingForMeterWithMarkup({
     billing: bill,
     totals: {
       consumption: bill.consumption,
-      base: bill.base,
-      vat: bill.vat,
-      wt: bill.wt,
-      penalty: bill.penalty,
-      total: bill.total,
+      base:        bill.base,
+      vat:         bill.vat,
+      wt:          bill.wt,
+      penalty:     bill.penalty,
+      total:       bill.total,
     },
+    previous_units: prevUnits,
     rate_of_change_percent: rateOfChangePercent,
     generated_at: new Date().toISOString().replace('T', ' ').slice(0, 19)
   };
