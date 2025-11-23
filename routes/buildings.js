@@ -28,7 +28,8 @@ const NUM_FIELDS = [
   'wrate_perCbM',  // water rate / m^3
   'wmin_con',      // water min consumption
   'lrate_perKg',   // LPG rate / kg
-  'markup_rate'    // NEW markup rate (0+)
+  'markup_rate',   // markup rate (0+)
+  'penalty_rate'   // NEW: penalty rate (0+)
 ];
 
 // Optional aliases accepted in payloads
@@ -52,6 +53,10 @@ const KEY_MAP = new Map([
   // markup aliases
   ['markuprate', 'markup_rate'],
   ['markup', 'markup_rate'],
+
+  // penalty rate aliases
+  ['penaltyrate', 'penalty_rate'],
+  ['penalty', 'penalty_rate'],
 ]);
 
 function normalizeKey(k) {
@@ -145,7 +150,7 @@ router.get(
  * POST /buildings
  * Create a building.
  * Write access: admin only
- * Body may include any of NUM_FIELDS, including markup_rate.
+ * Body may include any of NUM_FIELDS, including markup_rate and penalty_rate.
  */
 router.post(
   '/',
@@ -260,7 +265,7 @@ router.put(
 
 /**
  * GET /buildings/:id/base-rates
- * Read the set of base rates (includes markup_rate).
+ * Read the set of base rates (includes markup_rate and penalty_rate).
  * Read access: admin, biller, reader, operator
  */
 router.get(
@@ -277,6 +282,7 @@ router.get(
           'wrate_perCbM', 'wmin_con',
           'lrate_perKg',
           'markup_rate',
+          'penalty_rate', // NEW: include penalty_rate
           'last_updated', 'updated_by'
         ]
       });
@@ -292,8 +298,8 @@ router.get(
 /**
  * PUT /buildings/:id/base-rates
  * Update base rates.
- * - Admin: can update ALL rate fields, including markup_rate.
- * - Biller: can update utility-specific fields only (no markup_rate).
+ * - Admin: can update ALL rate fields, including markup_rate and penalty_rate.
+ * - Biller: can update utility-specific fields only (no markup_rate, no penalty_rate).
  */
 router.put(
   '/:id/base-rates',
@@ -319,7 +325,7 @@ router.put(
         // Admins can edit everything
         allowed = [...NUM_FIELDS];
       } else if (isBiller) {
-        // Billers: only utility rates, not markup_rate
+        // Billers: only utility rates, not markup_rate or penalty_rate
         allowed = ['erate_perKwH', 'emin_con', 'wrate_perCbM', 'wmin_con', 'lrate_perKg'];
       } else {
         return res.status(403).json({ error: 'Forbidden: role cannot edit base rates' });
@@ -352,6 +358,7 @@ router.put(
           'wrate_perCbM', 'wmin_con',
           'lrate_perKg',
           'markup_rate',
+          'penalty_rate', // NEW: include penalty_rate
           'last_updated', 'updated_by'
         ]
       });

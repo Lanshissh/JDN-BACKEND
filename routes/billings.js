@@ -139,14 +139,12 @@ router.get(
 
 
 
-
-
 /* =============================================================================
  * BUILDING fetch stored billing by header ID
  *   GET /billings/:building_billing_id
  * ========================================================================== */
 router.get(
-  '/:building_billing_id',
+  '/buildings/:building_billing_id',
   authorizeRole('admin', 'operator', 'biller'),
   attachBuildingScope(),
   async (req, res) => {

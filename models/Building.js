@@ -45,6 +45,13 @@ const Building = sequelize.define('Building', {
     validate: { min: 0 }
   },
 
+  penalty_rate: {
+    type: DataTypes.DECIMAL(10, 2),
+    allowNull: false,
+    defaultValue: 0.00,
+    validate: { min: 0 }
+  },
+
   last_updated:  { type: DataTypes.DATE, allowNull: false },
   updated_by:    { type: DataTypes.STRING(30), allowNull: false },
   }, {

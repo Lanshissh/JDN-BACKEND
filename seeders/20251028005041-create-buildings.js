@@ -18,6 +18,7 @@ module.exports = {
         wmin_con: 3.00,
         lrate_perKg: 88.00,
         markup_rate: 1.5,
+        penalty_rate: 0.2,
         last_updated: new Date(),
         updated_by: 'System Admin',
       },
@@ -30,6 +31,7 @@ module.exports = {
         wmin_con: 3.00,
         lrate_perKg: 88.00,
         markup_rate: 1.5,
+        penalty_rate: 0.2,
         last_updated: new Date(),
         updated_by: 'System Admin',
       }
