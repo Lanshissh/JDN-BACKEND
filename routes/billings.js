@@ -228,23 +228,24 @@ router.post(
         return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
-      // ---- building_name (for header) ----
-      let buildingName = null;
+      // Get building to retrieve penalty_rate
       const building = await Building.findOne({
         where: { building_id },
-        attributes: ['building_name'],
+        attributes: ['building_name', 'penalty_rate'],
         raw: true,
       });
-      buildingName = building?.building_name || null;
+      if (!building) {
+        return res.status(404).json({ error: 'Building not found.' });
+      }
+
+      const buildingName = building?.building_name || null;
+      const penaltyRatePct = Number(building.penalty_rate) || 0;
 
       // ---- SAME COMPUTE LOGIC AS YOUR GET ----
       const { meters } = await computeBillingForBuilding({
         buildingId: building_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
@@ -275,10 +276,15 @@ router.post(
         const consumed  = Number(entry?.totals?.consumption ?? 0);
         const base      = Number(entry?.totals?.base ?? 0);
         const vat       = Number(entry?.billing?.vat ?? 0);
+        const wt        = Number(entry?.billing?.wt ?? 0);
         const totalAmt  = Number(entry?.totals?.total ?? 0);
 
-        const utilityRate = consumed > 0 ? +(base / consumed).toFixed(6) : null; // equals system rate
+        const utilityRate = entry?.billing?.rates?.utility_rate ?? null;
+        const markupRate  = entry?.billing?.rates?.markup_rate ?? null;
+        const systemRate  = entry?.billing?.rates?.system_rate ?? (consumed > 0 ? +(base / consumed).toFixed(6) : null);
         const vatRate     = base > 0 ? +(vat / base).toFixed(4) : null;
+        const wtRate      = entry?.billing?.rates?.wt_rate ?? null; // ADD wt_rate
+        const penaltyRate = entry?.billing?.rates?.penalty_rate ?? null; // ADD penalty_rate
 
         rows.push({
           stall_no: stallNo,
@@ -293,9 +299,11 @@ router.post(
           reading_present: currIdx,
           consumed_kwh: consumed,
           utility_rate: utilityRate,
-          markup_rate: 0,
-          system_rate: utilityRate,
+          markup_rate: markupRate,
+          system_rate: systemRate,
           vat_rate: vatRate,
+          wt_rate: wtRate, // ADD wt_rate to output
+          penalty_rate: penaltyRate, // ADD penalty_rate to output
           total_amount: totalAmt,
           prev_consumed_kwh: prev_consumed_kwh,
           rate_of_change_pct: rate_of_change_pct,
@@ -412,13 +420,10 @@ router.get(
         return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
       const { meters } = await computeBillingForBuildingWithMarkup({
         buildingId: building_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
@@ -449,12 +454,15 @@ router.get(
         const consumed  = Number(entry?.totals?.consumption ?? 0);
         const base      = Number(entry?.totals?.base ?? 0);
         const vat       = Number(entry?.billing?.vat ?? 0);
+        const wt        = Number(entry?.billing?.wt ?? 0);
         const totalAmt  = Number(entry?.totals?.total ?? 0);
 
         const utilityRate = entry?.billing?.rates?.utility_rate ?? null;
         const markupRate  = entry?.billing?.rates?.markup_rate ?? null;
         const systemRate  = entry?.billing?.rates?.system_rate ?? (consumed > 0 ? +(base / consumed).toFixed(6) : null);
         const vatRate     = base > 0 ? +(vat / base).toFixed(4) : null;
+        const wtRate      = entry?.billing?.rates?.wt_rate ?? null; // ADD wt_rate
+        const penaltyRate = entry?.billing?.rates?.penalty_rate ?? null; // ADD penalty_rate
 
         rows.push({
           stall_no: stallNo,
@@ -472,6 +480,8 @@ router.get(
           markup_rate: markupRate,
           system_rate: systemRate,
           vat_rate: vatRate,
+          wt_rate: wtRate, // ADD wt_rate to output
+          penalty_rate: penaltyRate, // ADD penalty_rate to output
           total_amount: totalAmt,
           prev_consumed_kwh: prev_consumed_kwh,
           rate_of_change_pct: rate_of_change_pct,
@@ -538,23 +548,24 @@ router.post(
         return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
-      // ---- building_name (for header) ----
-      let buildingName = null;
+      // Get building to retrieve penalty_rate
       const building = await Building.findOne({
         where: { building_id },
-        attributes: ['building_name'],
+        attributes: ['building_name', 'penalty_rate'],
         raw: true,
       });
-      buildingName = building?.building_name || null;
+      if (!building) {
+        return res.status(404).json({ error: 'Building not found.' });
+      }
+
+      const buildingName = building?.building_name || null;
+      const penaltyRatePct = Number(building.penalty_rate) || 0;
 
       // ---- SAME COMPUTE LOGIC AS YOUR GET (but with markup) ----
       const { meters } = await computeBillingForBuildingWithMarkup({
         buildingId: building_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
@@ -585,6 +596,7 @@ router.post(
         const consumed  = Number(entry?.totals?.consumption ?? 0);
         const base      = Number(entry?.totals?.base ?? 0);
         const vat       = Number(entry?.billing?.vat ?? 0);
+        const wt        = Number(entry?.billing?.wt ?? 0);
         const totalAmt  = Number(entry?.totals?.total ?? 0);
 
         const utilityRate = entry?.billing?.rates?.utility_rate ?? null;
@@ -592,6 +604,8 @@ router.post(
         const systemRate  = entry?.billing?.rates?.system_rate
           ?? (consumed > 0 ? +(base / consumed).toFixed(6) : null);
         const vatRate     = base > 0 ? +(vat / base).toFixed(4) : null;
+        const wtRate      = entry?.billing?.rates?.wt_rate ?? null; // ADD wt_rate
+        const penaltyRate = entry?.billing?.rates?.penalty_rate ?? null; // ADD penalty_rate
 
         rows.push({
           stall_no: stallNo,
@@ -609,6 +623,8 @@ router.post(
           markup_rate: markupRate,
           system_rate: systemRate,
           vat_rate: vatRate,
+          wt_rate: wtRate, // ADD wt_rate to output
+          penalty_rate: penaltyRate, // ADD penalty_rate to output
           total_amount: totalAmt,
           prev_consumed_kwh: prev_consumed_kwh,
           rate_of_change_pct: rate_of_change_pct,
@@ -713,7 +729,7 @@ router.post(
  *   DELETE /billings/buildings/:building_billing_id
  * ========================================================================== */
 router.delete(
-  '/:building_billing_id',
+  '/buildings/:building_billing_id',
   authorizeRole('admin', 'operator', 'biller'),
   attachBuildingScope(),
   async (req, res) => {
@@ -753,7 +769,6 @@ router.delete(
 
 
 
-
 /* =============================================================================
  * METER (standard) — requires period-start + period-end
  * ========================================================================== */
@@ -772,13 +787,10 @@ router.get(
         return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
       const result = await computeBillingForMeter({
         meterId: meter_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
@@ -786,28 +798,29 @@ router.get(
       const roc = await computeROCForMeter({ meterId: meter_id, startDate, endDate });
       const rate_of_change_percent = roc?.rate_of_change ?? null;
 
-      const penalty_rate = (Number(penaltyRatePct) >= 1)
-        ? Number(penaltyRatePct) / 100
-        : Number(penaltyRatePct) || 0;
+      // Get penalty_rate from the billing result (which comes from Building model)
+      const penalty_rate = result?.billing?.rates?.penalty_rate || 0;
+      const wt_rate = result?.billing?.rates?.wt_rate || 0; // ADD wt_rate
 
       const base = Number(result?.billing?.base ?? 0);
       const vat  = Number(result?.billing?.vat ?? 0);
       const wt   = Number(result?.billing?.wt ?? 0);
       const vat_rate = base > 0 ? +(vat / base).toFixed(4) : null;
-      const wt_rate  = vat  > 0 ? +(wt  / vat ).toFixed(4) : null;
+      const wt_rate_calculated = vat > 0 ? +(wt / vat).toFixed(4) : null;
 
       const rates_used = {
         utility_rate: result?.billing?.rates?.utility_rate ?? null,
         markup_rate:  result?.billing?.rates?.markup_rate ?? null,
         system_rate:  result?.billing?.rates?.system_rate ?? null,
-        penalty_rate
+        penalty_rate,
+        wt_rate, // ADD wt_rate to rates_used
       };
 
       const taxes_used = {
         vat_code: result?.tenant?.vat_code || null,
         wt_code:  result?.tenant?.wt_code  || null,
         vat_rate,
-        wt_rate
+        wt_rate: wt_rate_calculated
       };
 
       const consumption_breakdown = {
@@ -834,187 +847,9 @@ router.get(
 
 
 /* =============================================================================
- * METER (standard) — CREATE billing row (compute + save)
- *   POST /billings/meters/:meter_id/period-start/:startDate/period-end/:endDate
+ * METER (with markup) — requires period-start + period-end
  * ========================================================================== */
-router.post(
-  '/meters/:meter_id/period-start/:startDate/period-end/:endDate',
-  authorizeRole('admin', 'operator', 'biller'),
-  authorizeUtility({ roles: ['operator', 'biller'], anyOf: ['electric', 'water', 'lpg'] }),
-  attachBuildingScope(),
-  enforceRecordBuilding(resolveBuildingForMeter),
-  async (req, res) => {
-    try {
-      const { meter_id, startDate, endDate } = req.params;
-
-      const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
-      if (!isYMD(startDate) || !isYMD(endDate)) {
-        return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
-      }
-
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
-      const result = await computeBillingForMeter({
-        meterId: meter_id,
-        startDate,
-        endDate,
-        penaltyRatePct,
-        restrictToBuildingIds: req.restrictToBuildingIds ?? null,
-      });
-
-      // keep ROC in sync with same custom window
-      const roc = await computeROCForMeter({ meterId: meter_id, startDate, endDate });
-      const rate_of_change_percent = roc?.rate_of_change ?? null;
-
-      const penalty_rate = (Number(penaltyRatePct) >= 1)
-        ? Number(penaltyRatePct) / 100
-        : Number(penaltyRatePct) || 0;
-
-      const base = Number(result?.billing?.base ?? 0);
-      const vat  = Number(result?.billing?.vat ?? 0);
-      const wt   = Number(result?.billing?.wt ?? 0);
-      const vat_rate = base > 0 ? +(vat / base).toFixed(4) : null;
-      const wt_rate  = vat  > 0 ? +(wt  / vat ).toFixed(4) : null;
-
-      const rates_used = {
-        utility_rate: result?.billing?.rates?.utility_rate ?? null,
-        markup_rate:  result?.billing?.rates?.markup_rate ?? null,
-        system_rate:  result?.billing?.rates?.system_rate ?? null,
-        penalty_rate
-      };
-
-      const taxes_used = {
-        vat_code: result?.tenant?.vat_code || null,
-        wt_code:  result?.tenant?.wt_code  || null,
-        vat_rate,
-        wt_rate
-      };
-
-      const consumption_breakdown = {
-        previous_month_units: roc?.previous_consumption ?? null,
-        current_month_units:  roc?.current_consumption ?? (result?.billing?.consumption ?? null),
-        rate_of_change_percent
-      };
-
-      // ---------- BUILDING NAME LOOKUP ----------
-      const buildingId = result?.stall?.building_id ?? null;
-      let buildingName = null;
-
-      if (buildingId) {
-        const bldg = await Building.findOne({
-          where: { building_id: buildingId },
-          attributes: ['building_name'],
-          raw: true,
-        });
-        buildingName = bldg?.building_name || null;
-      }
-
-      // stall object with building_name included for the response
-      const stallWithBuildingName = {
-        ...result.stall,
-        building_id: buildingId,
-        building_name: buildingName,
-      };
-
-      // ---------- PREPARE & CHECK BILLING ID (UNIQUE) ----------
-      const now = new Date();
-
-      // simple deterministic ID; adjust if you later use a sequence
-      const billing_id = `${meter_id}-${startDate}-${endDate}`;
-
-      // make sure billing_id is unique BEFORE creating
-      const existing = await Billing.findOne({ where: { billing_id } });
-      if (existing) {
-        return res.status(409).json({
-          error: 'Billing already exists for this meter and period.',
-          billing_id,
-        });
-      }
-
-      // ---------- SAVE TO billing_list ----------
-      const createdBilling = await Billing.create({
-        billing_id,
-
-        // scope references
-        meter_id:   result?.meter?.meter_id,
-        meter_sn:   result?.meter?.meter_sn ?? null,
-        stall_id:   result?.stall?.stall_id ?? null,
-        stall_sn:   result?.stall?.stall_sn ?? null,
-        tenant_id:  result?.tenant?.tenant_id ?? null,
-        tenant_sn:  result?.tenant?.tenant_sn ?? null,
-        tenant_name:result?.tenant?.tenant_name ?? null,
-        building_id:   buildingId,
-        building_name: buildingName,
-
-        // period
-        period_start: startDate,
-        period_end:   endDate,
-
-        // meter info
-        meter_type: result?.meter?.meter_type,
-        meter_mult: result?.meter?.meter_mult ?? 1,
-
-        // indices + consumption
-        prev_index:    result?.indices?.prev_index ?? 0,
-        curr_index:    result?.indices?.curr_index ?? 0,
-        consumption:   result?.billing?.consumption ?? 0,
-
-        // money
-        base:     base,
-        vat:      vat,
-        wt:       wt,
-        penalty:  result?.billing?.penalty ?? 0,
-        total:    result?.billing?.total ?? 0,
-
-        // rates
-        utility_rate: rates_used.utility_rate,
-        markup_rate:  rates_used.markup_rate,
-        system_rate:  rates_used.system_rate,
-        vat_rate,
-        wt_rate,
-
-        // tax codes + penalty rate used
-        vat_code: taxes_used.vat_code,
-        wt_code:  taxes_used.wt_code,
-        penalty_rate_pct: penaltyRatePct,
-
-        // ROC info
-        rate_of_change_percent,
-
-        // audit
-        generated_at: now,
-        last_updated: now,
-        updated_by: req.user?.user_id || req.user?.username || 'system',
-      });
-
-      // ---------- RESPONSE ----------
-      res.status(201).json({
-        ...result,
-        stall: stallWithBuildingName,  // now has building_name
-        rate_of_change_percent,
-        rates_used,
-        taxes_used,
-        consumption_breakdown,
-        period: { start: startDate, end: endDate },
-        generated_at: getCurrentDateTime(),
-        billing_row: createdBilling,
-      });
-    } catch (err) {
-      console.error('Billing (meter, create) error:', err);
-      res.status(err.status || 500).json({ error: err.message });
-    }
-  }
-);
-
-
-
-
-
-/* =============================================================================
- * METER (with markup) — CREATE billing row (compute + save)
- *   POST /billings/with-markup/meters/:meter_id/period-start/:startDate/period-end/:endDate
- * ========================================================================== */
-router.post(
+router.get(
   '/with-markup/meters/:meter_id/period-start/:startDate/period-end/:endDate',
   authorizeRole('admin', 'operator', 'biller'),
   authorizeUtility({ roles: ['operator', 'biller'], anyOf: ['electric', 'water', 'lpg'] }),
@@ -1029,40 +864,38 @@ router.post(
         return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
       const result = await computeBillingForMeterWithMarkup({
         meterId: meter_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
       // ---- Derive convenience fields (same style as GET) ----
-      const penalty_rate = (Number(penaltyRatePct) >= 1)
-        ? Number(penaltyRatePct) / 100
-        : Number(penaltyRatePct) || 0;
+      // Get penalty_rate from the billing result (which comes from Building model)
+      const penalty_rate = result?.billing?.rates?.penalty_rate || 0;
+      const wt_rate = result?.billing?.rates?.wt_rate || 0; // ADD wt_rate
 
       const base = Number(result?.billing?.base ?? 0);
       const vat  = Number(result?.billing?.vat ?? 0);
       const wt   = Number(result?.billing?.wt ?? 0);
 
       const vat_rate = base > 0 ? +(vat / base).toFixed(4) : null;
-      const wt_rate  = vat  > 0 ? +(wt  / vat ).toFixed(4)  : null;
+      const wt_rate_calculated = vat > 0 ? +(wt / vat).toFixed(4) : null;
 
       const rates_used = {
         utility_rate: result?.billing?.rates?.utility_rate ?? null,
         markup_rate:  result?.billing?.rates?.markup_rate  ?? null,
         system_rate:  result?.billing?.rates?.system_rate  ?? null,
         penalty_rate,
+        wt_rate, // ADD wt_rate to rates_used
       };
 
       const taxes_used = {
         vat_code: result?.tenant?.vat_code || null,
         wt_code:  result?.tenant?.wt_code  || null,
         vat_rate,
-        wt_rate,
+        wt_rate: wt_rate_calculated
       };
 
       const rate_of_change_percent = result?.rate_of_change_percent ?? null;
@@ -1073,114 +906,21 @@ router.post(
         rate_of_change_percent,
       };
 
-      // ---- BUILDING NAME LOOKUP ----
-      const buildingId = result?.stall?.building_id ?? null;
-      let buildingName = null;
-
-      if (buildingId) {
-        const bldg = await Building.findOne({
-          where: { building_id: buildingId },
-          attributes: ['building_name'],
-          raw: true,
-        });
-        buildingName = bldg?.building_name || null;
-      }
-
-      const stallWithBuildingName = {
-        ...result.stall,
-        building_id: buildingId,
-        building_name: buildingName,
-      };
-
-      // ---- PREPARE & CHECK BILLING ID (UNIQUE) ----
-      const now = new Date();
-
-      // Same style as standard meter POST route
-      const billing_id = `${meter_id}-${startDate}-${endDate}`;
-
-      const existing = await Billing.findOne({ where: { billing_id } });
-      if (existing) {
-        return res.status(409).json({
-          error: 'Billing already exists for this meter and period.',
-          billing_id,
-        });
-      }
-
-      // ---- SAVE TO billing_list ----
-      const createdBilling = await Billing.create({
-        billing_id,
-
-        // scope references
-        meter_id:     result?.meter?.meter_id,
-        meter_sn:     result?.meter?.meter_sn ?? null,
-        stall_id:     result?.stall?.stall_id ?? null,
-        stall_sn:     result?.stall?.stall_sn ?? null,
-        tenant_id:    result?.tenant?.tenant_id ?? null,
-        tenant_sn:    result?.tenant?.tenant_sn ?? null,
-        tenant_name:  result?.tenant?.tenant_name ?? null,
-        building_id:  buildingId,
-        building_name: buildingName,
-
-        // period
-        period_start: startDate,
-        period_end:   endDate,
-
-        // meter info
-        meter_type: result?.meter?.meter_type,
-        meter_mult: result?.meter?.meter_mult ?? 1,
-
-        // indices + consumption (default 0 if not provided)
-        prev_index:  Number(result?.indices?.prev_index ?? 0),
-        curr_index:  Number(result?.indices?.curr_index ?? 0),
-        consumption: Number(result?.billing?.consumption ?? 0),
-
-        // money
-        base,
-        vat,
-        wt,
-        penalty: result?.billing?.penalty ?? 0,
-        total:   result?.billing?.total   ?? 0,
-
-        // rates
-        utility_rate: rates_used.utility_rate,
-        markup_rate:  rates_used.markup_rate,
-        system_rate:  rates_used.system_rate,
-        vat_rate,
-        wt_rate,
-
-        // tax codes + penalty rate used
-        vat_code: taxes_used.vat_code,
-        wt_code:  taxes_used.wt_code,
-        penalty_rate_pct: penaltyRatePct,   // store raw (e.g. 2 for "2%")
-
-        // ROC info
-        rate_of_change_percent,
-
-        // audit
-        generated_at: now,
-        last_updated: now,
-        updated_by: req.user?.user_id || req.user?.username || 'system',
-      });
-
-      // ---- RESPONSE ----
-      res.status(201).json({
+      res.json({
         ...result,
-        stall: stallWithBuildingName,      // includes building_name
         rate_of_change_percent,
         rates_used,
         taxes_used,
         consumption_breakdown,
         period: { start: startDate, end: endDate },
         generated_at: getCurrentDateTime(),
-        billing_row: createdBilling,       // saved DB row
       });
     } catch (err) {
-      console.error('Billing (meter + markup, create) error:', err);
+      console.error('Billing (meter + markup) error:', err);
       res.status(err.status || 500).json({ error: err.message });
     }
   }
 );
-
 
 
 /* =============================================================================
@@ -1198,13 +938,10 @@ router.get(
         return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
       const { meters, totals_by_type, grand_totals } = await computeBillingForTenant({
         tenantId: tenant_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
@@ -1218,7 +955,21 @@ router.get(
           const roc = await computeROCForMeter({ meterId, startDate, endDate });
           rate_of_change_percent = roc?.rate_of_change ?? null;
         } catch { rate_of_change_percent = null; }
-        metersWithROC.push({ ...entry, rate_of_change_percent });
+        
+        // Add wt_rate and penalty_rate to each meter entry
+        const enhancedEntry = {
+          ...entry,
+          rate_of_change_percent,
+          billing: {
+            ...entry.billing,
+            rates: {
+              ...entry.billing?.rates,
+              wt_rate: entry.billing?.rates?.wt_rate || null, // ADD wt_rate
+              penalty_rate: entry.billing?.rates?.penalty_rate || null, // ADD penalty_rate
+            }
+          }
+        };
+        metersWithROC.push(enhancedEntry);
       }
 
       res.json({
@@ -1254,13 +1005,10 @@ router.get(
         return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
-      const penaltyRatePct = Number(req.query.penalty_rate) || 0;
-
       const { meters, totals_by_type, grand_totals } = await computeBillingForTenantWithMarkup({
         tenantId: tenant_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds: req.restrictToBuildingIds ?? null,
       });
 
@@ -1274,7 +1022,21 @@ router.get(
           const roc = await computeROCForMeter({ meterId, startDate, endDate });
           rate_of_change_percent = roc?.rate_of_change ?? null;
         } catch { rate_of_change_percent = null; }
-        metersWithROC.push({ ...entry, rate_of_change_percent });
+        
+        // Add wt_rate and penalty_rate to each meter entry
+        const enhancedEntry = {
+          ...entry,
+          rate_of_change_percent,
+          billing: {
+            ...entry.billing,
+            rates: {
+              ...entry.billing?.rates,
+              wt_rate: entry.billing?.rates?.wt_rate || null, // ADD wt_rate
+              penalty_rate: entry.billing?.rates?.penalty_rate || null, // ADD penalty_rate
+            }
+          }
+        };
+        metersWithROC.push(enhancedEntry);
       }
 
       res.json({

@@ -160,12 +160,14 @@ function computeUnitsOnly(meterType, meterMult, building, prevIdx, currIdx) {
 }
 
 function computeChargesByType(
-  mtype, mult, building, taxKnobs, prevIdx, currIdx, forPenalty, penaltyRate
+  mtype, mult, building, taxKnobs, prevIdx, currIdx, forPenalty
 ) {
   const t = String(mtype || '').toLowerCase();
   const rate = getUtilityRate(t, building);
   const vatR = t === 'electric' ? taxKnobs.vat.e : t === 'water' ? taxKnobs.vat.w : taxKnobs.vat.l;
   const wtR  = t === 'electric' ? taxKnobs.wt.e  : t === 'water' ? taxKnobs.wt.w  : taxKnobs.wt.l;
+  // Use penalty_rate from building instead of parameter
+  const penaltyRate = normalizePct(building.penalty_rate || 0);
   const consumption = computeUnitsOnly(t, mult, building, prevIdx, currIdx);
   const base = consumption * rate;
   const taxes = applyTaxes({ base, vatRate: vatR, wtRate: wtR, forPenalty, penaltyRate });
@@ -176,16 +178,24 @@ function computeChargesByType(
     wt: taxes.wt,
     penalty: taxes.penalty,
     total: taxes.total,
-    rates: { utility_rate: rate, markup_rate: 0, system_rate: rate },
+    rates: { 
+      utility_rate: rate, 
+      markup_rate: 0, 
+      system_rate: rate,
+      penalty_rate: penaltyRate,
+      wt_rate: wtR  
+    },
   };
 }
 
 function computeChargesByTypeWithMarkup(
-  mtype, mult, building, taxKnobs, prevIdx, currIdx, forPenalty, penaltyRate
+  mtype, mult, building, taxKnobs, prevIdx, currIdx, forPenalty
 ) {
   const t = String(mtype || '').toLowerCase();
   const utilityRate = getUtilityRate(t, building);
   const markup      = Number(building.markup_rate) || 0;
+  // Use penalty_rate from building instead of parameter
+  const penaltyRate = normalizePct(building.penalty_rate || 0);
   const systemRate  = utilityRate + markup;
   const vatR = t === 'electric' ? taxKnobs.vat.e : t === 'water' ? taxKnobs.vat.w : taxKnobs.vat.l;
   const wtR  = t === 'electric' ? taxKnobs.wt.e  : t === 'water' ? taxKnobs.wt.w  : taxKnobs.wt.l;
@@ -199,13 +209,19 @@ function computeChargesByTypeWithMarkup(
     wt: taxes.wt,
     penalty: taxes.penalty,
     total: taxes.total,
-    rates: { utility_rate: utilityRate, markup_rate: markup, system_rate: systemRate },
+    rates: { 
+      utility_rate: utilityRate, 
+      markup_rate: markup, 
+      system_rate: systemRate,
+      penalty_rate: penaltyRate,
+      wt_rate: wtR  
+    },
   };
 }
 
-// Requires: startDate (string, YYYY-MM-DD) and endDate (string, YYYY-MM-DD)
+// Remove penaltyRatePct parameter since we get it from Building
 async function computeBillingForMeter({
-  meterId, startDate, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
+  meterId, startDate, endDate, restrictToBuildingIds = null
 }) {
   // --- quick validators ---
   const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
@@ -230,7 +246,7 @@ async function computeBillingForMeter({
 
   if (Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length) {
     if (!restrictToBuildingIds.includes(String(stall.building_id))) {
-      const e = new Error('No access to this record’s building');
+      const e = new Error('No access to this records building');
       e.status = 403; throw e;
     }
   }
@@ -241,7 +257,8 @@ async function computeBillingForMeter({
       'building_id',
       'emin_con','wmin_con',
       'erate_perKwH','wrate_perCbM','lrate_perKg',
-      'markup_rate'
+      'markup_rate',
+      'penalty_rate'  // We get penalty_rate from here
     ],
     raw: true
   });
@@ -256,7 +273,6 @@ async function computeBillingForMeter({
 
   const taxKnobs   = await getTenantTaxKnobs(tenant);
   const forPenalty = !!tenant.for_penalty;
-  const penaltyRate = normalizePct(penaltyRatePct);
 
   // --- build previous full calendar month (relative to endDate) + anchor month ---
   const end = new Date(endDate + 'T00:00:00Z');
@@ -291,7 +307,7 @@ async function computeBillingForMeter({
   const mult  = Number(meter.meter_mult) || 1;
 
   const bill = computeChargesByType(
-    mtype, mult, building, taxKnobs, prevMax.value, currMax.value, forPenalty, penaltyRate
+    mtype, mult, building, taxKnobs, prevMax.value, currMax.value, forPenalty
   );
 
   // --- ROC-style prev/current units for percentage (anchor→prev, prev→curr) ---
@@ -347,12 +363,11 @@ async function computeBillingForMeter({
   };
 }
 
-
+// Remove penaltyRatePct parameter since we get it from Building
 async function computeBillingForMeterWithMarkup({
   meterId,
   startDate,
   endDate,
-  penaltyRatePct = 0,
   restrictToBuildingIds = null
 }) {
   // --- validate dates ---
@@ -382,7 +397,7 @@ async function computeBillingForMeterWithMarkup({
 
   if (Array.isArray(restrictToBuildingIds) && restrictToBuildingIds.length) {
     if (!restrictToBuildingIds.includes(String(stall.building_id))) {
-      const e = new Error('No access to this record’s building'); e.status = 403; throw e;
+      const e = new Error('No access to this records building'); e.status = 403; throw e;
     }
   }
 
@@ -392,7 +407,8 @@ async function computeBillingForMeterWithMarkup({
       'building_id',
       'emin_con','wmin_con',
       'erate_perKwH','wrate_perCbM','lrate_perKg',
-      'markup_rate'
+      'markup_rate',
+      'penalty_rate'  // We get penalty_rate from here
     ],
     raw: true
   });
@@ -407,7 +423,6 @@ async function computeBillingForMeterWithMarkup({
 
   const taxKnobs   = await getTenantTaxKnobs(tenant);
   const forPenalty = !!tenant.for_penalty;
-  const penaltyRate = normalizePct(penaltyRatePct);
 
   // --- periods: previous full calendar month of endDate + its anchor month ---
   const { monthSpanFor, getMaxReadingInPeriod } = require('../utils/rocUtils');
@@ -429,7 +444,7 @@ async function computeBillingForMeterWithMarkup({
   const mult  = Number(meter.meter_mult) || 1;
 
   const bill = computeChargesByTypeWithMarkup(
-    mtype, mult, building, taxKnobs, prevMax.value, currMax.value, forPenalty, penaltyRate
+    mtype, mult, building, taxKnobs, prevMax.value, currMax.value, forPenalty
   );
 
   // --- ROC-style units for percentage: (anchor→prev) vs (prev→curr) ---
@@ -486,8 +501,9 @@ async function computeBillingForMeterWithMarkup({
   };
 }
 
+// Remove penaltyRatePct parameter since we get it from Building
 async function computeBillingForTenant({
-  tenantId, startDate, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
+  tenantId, startDate, endDate, restrictToBuildingIds = null
 }) {
   const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
   if (!isYMD(startDate) || !isYMD(endDate)) {
@@ -532,7 +548,6 @@ async function computeBillingForTenant({
       meterId: m.meter_id,
       startDate,
       endDate,
-      penaltyRatePct,
       restrictToBuildingIds
     });
 
@@ -566,9 +581,9 @@ async function computeBillingForTenant({
   return { meters: results, totals_by_type, grand_totals };
 }
 
-
+// Remove penaltyRatePct parameter since we get it from Building
 async function computeBillingForTenantWithMarkup({
-  tenantId, startDate, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
+  tenantId, startDate, endDate, restrictToBuildingIds = null
 }) {
   const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
   if (!isYMD(startDate) || !isYMD(endDate)) {
@@ -602,8 +617,8 @@ async function computeBillingForTenantWithMarkup({
   const results = [];
   const totals_by_type = {
     electric: { base:0, vat:0, wt:0, penalty:0, total:0 },
-    water:    { base:0, vat:0, wt:0, penalty:0, total:0 },
-    lpg:      { base:0, vat:0, wt:0, penalty:0, total:0 }
+        water:    { base:0, vat:0, wt:0, penalty:0, total:0 },
+        lpg:      { base:0, vat:0, wt:0, penalty:0, total:0 }
   };
   const grand_totals = { base:0, vat:0, wt:0, penalty:0, total:0 };
 
@@ -613,7 +628,6 @@ async function computeBillingForTenantWithMarkup({
       meterId: m.meter_id,
       startDate,
       endDate,
-      penaltyRatePct,
       restrictToBuildingIds
     });
 
@@ -647,10 +661,9 @@ async function computeBillingForTenantWithMarkup({
   return { meters: results, totals_by_type, grand_totals };
 }
 
-
-
+// Remove penaltyRatePct parameter since we get it from Building
 async function computeBillingForBuilding({
-  buildingId, startDate, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
+  buildingId, startDate, endDate, restrictToBuildingIds = null
 }) {
   const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
   if (!isYMD(startDate) || !isYMD(endDate)) {
@@ -691,7 +704,6 @@ async function computeBillingForBuilding({
         meterId: m.meter_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds
       });
 
@@ -734,9 +746,9 @@ async function computeBillingForBuilding({
   return { meters: results, totals_by_type, grand_totals };
 }
 
-
+// Remove penaltyRatePct parameter since we get it from Building
 async function computeBillingForBuildingWithMarkup({
-  buildingId, startDate, endDate, penaltyRatePct = 0, restrictToBuildingIds = null
+  buildingId, startDate, endDate, restrictToBuildingIds = null
 }) {
   const isYMD = (s) => typeof s === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(s);
   if (!isYMD(startDate) || !isYMD(endDate)) {
@@ -779,7 +791,6 @@ async function computeBillingForBuildingWithMarkup({
         meterId: m.meter_id,
         startDate,
         endDate,
-        penaltyRatePct,
         restrictToBuildingIds
       });
 
@@ -821,8 +832,6 @@ async function computeBillingForBuildingWithMarkup({
 
   return { meters: results, totals_by_type, grand_totals };
 }
-
-
 
 module.exports = {
   computeBillingForMeter,
