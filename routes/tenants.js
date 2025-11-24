@@ -67,10 +67,10 @@ function toBool(v, fallback = false) {
 
 /**
  * GET /tenants
- * - admin: can see all
- * - operator/biller: scoped to their building_id (via attachBuildingScope)
+ * - admin: can see all (optionally filter by ?building_id=...)
+ * - operator/biller: scoped to their building_ids from JWT
  * Supports query params:
- *   q           - search in tenant_sn, tenant_name
+ *   q           - search in tenant_sn, tenant_name, tenant_id
  *   status      - exact match (e.g., active/inactive)
  *   building_id - admin only (overrides scope if provided)
  */
@@ -78,27 +78,49 @@ router.get(
   '/',
   authenticateToken,
   authorizeRole('admin', 'operator', 'biller'),
-  attachBuildingScope(), // sets req.buildingWhere helper for non-admins
   async (req, res) => {
     try {
       const { q, status, building_id } = req.query || {};
 
-      const where = {
-        ...req.buildingWhere?.(), // restrict when not admin
-      };
+      // Roles now come from user_roles array in the JWT
+      const rawRoles = Array.isArray(req.user?.user_roles)
+        ? req.user.user_roles
+        : [];
+      const roles = rawRoles.map((r) => String(r).toLowerCase());
+      const isAdmin = roles.includes('admin');
 
-      if (status) where.tenant_status = status;
+      const where = {};
 
-      // allow admin to filter by building explicitly
-      if (building_id && (req.user?.user_level || '').toLowerCase() === 'admin') {
-        where.building_id = building_id;
+      if (isAdmin) {
+        // Admin: optional explicit building filter via query
+        if (building_id) {
+          where.building_id = String(building_id);
+        }
+      } else {
+        // Operator / biller: restrict to building_ids from JWT
+        const bIds = Array.isArray(req.user?.building_ids)
+          ? req.user.building_ids.map((id) => String(id))
+          : [];
+
+        if (!bIds.length) {
+          return res
+            .status(401)
+            .json({ error: 'Unauthorized: No building assigned to this user.' });
+        }
+
+        where.building_id =
+          bIds.length === 1 ? bIds[0] : { [Op.in]: bIds };
+      }
+
+      if (status) {
+        where.tenant_status = status;
       }
 
       if (q) {
         where[Op.or] = [
-          { tenant_sn: { [Op.like]: `%${q}%` } },
+          { tenant_sn:   { [Op.like]: `%${q}%` } },
           { tenant_name: { [Op.like]: `%${q}%` } },
-          { tenant_id: { [Op.like]: `%${q}%` } },
+          { tenant_id:   { [Op.like]: `%${q}%` } },
         ];
       }
 

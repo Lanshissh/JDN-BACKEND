@@ -13,41 +13,131 @@ const {
 
 const { Op } = require('sequelize');
 
-const Meter   = require('../models/Meter');
-const Stall   = require('../models/Stall');
+const Meter = require('../models/Meter');
+const Stall = require('../models/Stall');
 const Reading = require('../models/Reading');
+const Tenant = require('../models/Tenant'); // <-- NEW
 
 // All routes require a valid token
 router.use(authenticateToken);
 
-const ALLOWED_TYPES   = new Set(['electric', 'water', 'lpg']);
-const ALLOWED_STATUS  = new Set(['active', 'inactive']);
+const ALLOWED_TYPES = new Set(['electric', 'water', 'lpg']);
+const ALLOWED_STATUS = new Set(['active', 'inactive']);
 
 /**
  * GET /meters
  * - admin: all
  * - operator: only meters in their building (via Stall.building_id)
+ * Now also returns:
+ *   - tenant_id
+ *   - tenant_name
+ *   - tenant_sn (if present on Tenant)
  */
 router.get('/',
   authorizeRole('admin', 'operator'),
   attachBuildingScope(),
   async (req, res) => {
     try {
+      let meters = [];
+      let stallRows = [];
+
+      // -------------------------------------------------------------------
+      // ADMIN: no building restriction
+      // -------------------------------------------------------------------
       if (!req.restrictToBuildingId) {
-        const meters = await Meter.findAll();
-        return res.json(meters);
+        // All meters
+        meters = await Meter.findAll({ raw: true });
+        if (!meters.length) {
+          return res.json([]);
+        }
+
+        const stallIds = [...new Set(
+          meters.map(m => m.stall_id).filter(Boolean)
+        )];
+
+        if (stallIds.length) {
+          stallRows = await Stall.findAll({
+            where: { stall_id: stallIds },
+            attributes: ['stall_id', 'tenant_id'],
+            raw: true
+          });
+        }
+      } else {
+        // -----------------------------------------------------------------
+        // OPERATOR: restricted to a single building
+        // -----------------------------------------------------------------
+        stallRows = await Stall.findAll({
+          where: { building_id: req.restrictToBuildingId },
+          attributes: ['stall_id', 'tenant_id'],
+          raw: true
+        });
+
+        const stallIds = [...new Set(
+          stallRows.map(s => s.stall_id).filter(Boolean)
+        )];
+
+        if (!stallIds.length) {
+          return res.json([]);
+        }
+
+        meters = await Meter.findAll({
+          where: { stall_id: stallIds },
+          raw: true
+        });
+
+        if (!meters.length) {
+          return res.json([]);
+        }
       }
 
-      const stallRows = await Stall.findAll({
-        where: { building_id: req.restrictToBuildingId },
-        attributes: ['stall_id'],
-        raw: true
-      });
-      const stallIds = stallRows.map(s => s.stall_id);
-      if (stallIds.length === 0) return res.json([]);
+      // If there are no stalls, just return meters with null tenant fields
+      if (!stallRows.length) {
+        const resultNoStall = meters.map(m => ({
+          ...m,
+          tenant_id: null,
+          tenant_name: null,
+          tenant_sn: null
+        }));
+        return res.json(resultNoStall);
+      }
 
-      const meters = await Meter.findAll({ where: { stall_id: stallIds } });
-      return res.json(meters);
+      // Map: stall_id -> tenant_id
+      const stallToTenant = new Map(
+        stallRows.map(s => [s.stall_id, s.tenant_id])
+      );
+
+      // Collect tenant_ids to fetch
+      const tenantIds = [...new Set(
+        stallRows.map(s => s.tenant_id).filter(Boolean)
+      )];
+
+      let tenantMap = new Map();
+      if (tenantIds.length) {
+        const tenants = await Tenant.findAll({
+          where: { tenant_id: tenantIds },
+          attributes: ['tenant_id', 'tenant_name', 'tenant_sn'],
+          raw: true
+        });
+
+        tenantMap = new Map(
+          tenants.map(t => [t.tenant_id, t])
+        );
+      }
+
+      // Enrich meters with tenant info
+      const result = meters.map(m => {
+        const tenantId = stallToTenant.get(m.stall_id) || null;
+        const tenant = tenantId ? tenantMap.get(tenantId) : null;
+
+        return {
+          ...m,
+          tenant_id: tenantId,
+          tenant_name: tenant?.tenant_name || null,
+          tenant_sn: tenant?.tenant_sn || null
+        };
+      });
+
+      return res.json(result);
     } catch (err) {
       console.error('Database error:', err);
       res.status(500).json({ error: err.message });
@@ -261,13 +351,13 @@ router.put(
       }
 
       await meter.update({
-        meter_type:    meter_type    ?? meter.meter_type,
-        meter_sn:      meter_sn      ?? meter.meter_sn,
-        stall_id:      stall_id      ?? meter.stall_id,
-        meter_status:  meter_status  ?? meter.meter_status,
-        meter_mult:    finalMult,
-        last_updated:  getCurrentDateTime(),
-        updated_by:    req.user?.user_fullname || 'system'
+        meter_type: meter_type ?? meter.meter_type,
+        meter_sn: meter_sn ?? meter.meter_sn,
+        stall_id: stall_id ?? meter.stall_id,
+        meter_status: meter_status ?? meter.meter_status,
+        meter_mult: finalMult,
+        last_updated: getCurrentDateTime(),
+        updated_by: req.user?.user_fullname || 'system'
       });
 
       res.json({ message: `Meter with ID ${meterId} updated successfully` });

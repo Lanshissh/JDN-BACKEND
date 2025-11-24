@@ -91,6 +91,19 @@ function toImageBuffer(input) {
   throw new Error('image must be hex, base64, base64url, or data URL base64');
 }
 
+// Resolve building_id for the current user.
+// We only have building_ids array in the JWT payload (see auth.js),
+// so pick the first one as the primary building. If none, return null.
+function getUserBuildingId(req) {
+  if (!req || !req.user) return null;
+
+  // If a direct building_id was ever added later, prefer that.
+  if (req.user.building_id) return req.user.building_id;
+
+  const ids = Array.isArray(req.user.building_ids) ? req.user.building_ids : [];
+  return ids.length > 0 ? ids[0] : null;
+}
+
 // Resolve building_id for a meter
 async function getMeterBuildingId(meterId) {
   const meter = await Meter.findOne({ where: { meter_id: meterId }, attributes: ['stall_id', 'building_id'], raw: true });
@@ -143,7 +156,7 @@ router.get('/',
         return res.json(readings);
       }
 
-      const buildingId = req.user?.building_id;
+      const buildingId = getUserBuildingId(req);
       if (!buildingId) {
         return res.status(401).json({ error: 'Unauthorized: No building assigned' });
       }
@@ -187,7 +200,7 @@ router.get('/:id',
         return res.json(reading);
       }
 
-      const buildingId = req.user?.building_id;
+      const buildingId = getUserBuildingId(req);
       if (!buildingId) return res.status(401).json({ error: 'Unauthorized: No building assigned' });
 
       const recordBuildingId = await getReadingBuildingId(readingId);
@@ -206,27 +219,44 @@ router.get('/:id',
 /**
  * GET /meter_reading/:id/image
  * Streams the stored image bytes; admin bypasses building checks
+ * Supports images stored as Buffer **or** base64/dataURL/hex text.
  */
 router.get('/:id/image',
   authorizeRole('admin', 'operator', 'biller', 'reader'),
   async (req, res) => {
     try {
-      const reading = await Reading.findOne({ where: { reading_id: req.params.id } });
+      const readingId = req.params.id;
+      const reading = await Reading.findOne({ where: { reading_id: readingId } });
+
       if (!reading) return res.status(404).json({ error: 'Reading not found' });
       if (!reading.image) return res.status(404).json({ error: 'No image for this reading' });
 
+      // Building access check for non-admin
       if (!isAdmin(req)) {
-        const buildingId = req.user?.building_id;
+        const buildingId = getUserBuildingId(req);
         if (!buildingId) return res.status(401).json({ error: 'Unauthorized: No building assigned' });
-        const recordBuildingId = await getReadingBuildingId(req.params.id);
+
+        const recordBuildingId = await getReadingBuildingId(readingId);
         if (recordBuildingId && recordBuildingId !== buildingId) {
           return res.status(403).json({ error: 'No access: This meter reading is not under your assigned building.' });
         }
       }
 
-      // If you store a mime_type separately, set it here; default to octet-stream
-      res.setHeader('Content-Type', 'application/octet-stream');
-      res.send(reading.image);
+      // 🔑 Normalize whatever is stored (Buffer, base64, data URL, hex) into real bytes
+      let imageBuf;
+      try {
+        imageBuf = toImageBuffer(reading.image);
+        if (!imageBuf || !imageBuf.length) {
+          return res.status(404).json({ error: 'Stored image is empty or invalid' });
+        }
+      } catch (e) {
+        console.error('Error decoding stored image:', e);
+        return res.status(500).json({ error: 'Failed to decode stored image data' });
+      }
+
+      // Default to JPEG; adjust if you later store mime type separately
+      res.setHeader('Content-Type', 'image/jpeg');
+      res.send(imageBuf);
     } catch (err) {
       console.error('Error in GET /meter_reading/:id/image:', err);
       res.status(500).json({ error: err.message });
@@ -252,7 +282,7 @@ router.get('/by-date/:date',
         return res.json(rows);
       }
 
-      const buildingId = req.user?.building_id;
+      const buildingId = getUserBuildingId(req);
       if (!buildingId) return res.status(401).json({ error: 'Unauthorized: No building assigned' });
 
       const stalls = await Stall.findAll({ where: { building_id: buildingId }, attributes: ['stall_id'], raw: true });
@@ -289,7 +319,7 @@ router.get('/today',
         return res.json(rows);
       }
 
-      const buildingId = req.user?.building_id;
+      const buildingId = getUserBuildingId(req);
       if (!buildingId) return res.status(401).json({ error: 'Unauthorized: No building assigned' });
 
       const stalls = await Stall.findAll({ where: { building_id: buildingId }, attributes: ['stall_id'], raw: true });
@@ -328,7 +358,7 @@ router.get('/by-meter/:meter_id',
       if (!meter) return res.status(404).json({ error: 'Meter not found' });
 
       if (!isAdmin(req)) {
-        const userBldg = req.user?.building_id;
+        const userBldg = getUserBuildingId(req);
         if (!userBldg) return res.status(401).json({ error: 'Unauthorized: No building assigned' });
         const meterBldg = await getMeterBuildingId(meterId);
         if (!meterBldg || meterBldg !== userBldg) {
@@ -371,7 +401,7 @@ router.get('/by-meter/:meter_id',
  * REQUIRED: image (base64/base64url/data URL/hex/Buffer). remarks optional.
  */
 router.post('/',
-  authorizeRole('admin', 'operator','reader'),
+  authorizeRole('admin', 'operator'),
   async (req, res) => {
     let { meter_id, reading_value, lastread_date, remarks, image } = req.body || {};
 
@@ -404,7 +434,7 @@ router.post('/',
       if (!meter) return res.status(404).json({ error: 'Meter not found' });
 
       if (!isAdmin(req)) {
-        const userBldg = req.user?.building_id;
+        const userBldg = getUserBuildingId(req);
         if (!userBldg) return res.status(401).json({ error: 'Unauthorized: No building assigned' });
         const meterBldg = await getMeterBuildingId(meter_id);
         if (!meterBldg || meterBldg !== userBldg) {
@@ -459,7 +489,7 @@ router.post('/',
  * remarks is optional; send null to clear remarks.
  */
 router.put('/:id',
-  authorizeRole('admin', 'operator','reader'),
+  authorizeRole('admin', 'operator'),
   async (req, res) => {
     const readingId = req.params.id;
     let { meter_id, reading_value, lastread_date, remarks, image } = req.body || {};
@@ -471,7 +501,7 @@ router.put('/:id',
       if (!reading) return res.status(404).json({ error: 'Reading not found' });
 
       if (!isAdmin(req)) {
-        const userBldg = req.user?.building_id;
+        const userBldg = getUserBuildingId(req);
         if (!userBldg) return res.status(401).json({ error: 'Unauthorized: No building assigned' });
 
         const currentBldg = await getReadingBuildingId(readingId);
@@ -538,7 +568,7 @@ router.put('/:id',
         reading.remarks = (remarks ?? null);
       }
 
-      // image is REQUIRED in DB; do NOT allow clearing to null/empty
+      // image is REQUIRED in DB; do NOT allow clearing to null/emptys
       if (image !== undefined) {
         if (image === null || image === '') {
           return res.status(400).json({ error: 'image is required; do not send null/empty to clear it' });
@@ -572,7 +602,7 @@ router.put('/:id',
  * Admin: any; Non-admin: only under their building.
  */
 router.delete('/:id',
-  authorizeRole('admin', 'operator','reader'),
+  authorizeRole('admin', 'operator'),
   async (req, res) => {
     const readingId = req.params.id;
     if (!readingId) {
@@ -585,7 +615,7 @@ router.delete('/:id',
       }
 
       if (!isAdmin(req)) {
-        const userBldg = req.user?.building_id;
+        const userBldg = getUserBuildingId(req);
         if (!userBldg) {
           return res.status(401).json({ error: 'Unauthorized: No building assigned' });
         }

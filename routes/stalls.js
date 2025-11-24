@@ -31,7 +31,9 @@ router.get('/',
   attachBuildingScope(),
   async (req, res) => {
     try {
-      const stalls = await Stall.findAll({ where: req.buildingWhere() });
+    const stalls = await Stall.findAll({
+      where: req.buildingWhere('building_id'),
+    });
       return res.json(stalls); // 200 with [] if none
     } catch (err) {
       console.error('Database error:', err);
