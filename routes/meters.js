@@ -34,7 +34,7 @@ const ALLOWED_STATUS = new Set(['active', 'inactive']);
  *   - tenant_sn (if present on Tenant)
  */
 router.get('/',
-  authorizeRole('admin', 'operator'),
+  authorizeRole('admin', 'operator', 'biller', 'reader'),
   attachBuildingScope(),
   async (req, res) => {
     try {

@@ -27,14 +27,14 @@ const ALLOWED_STATUS = new Set(['occupied', 'available', 'under maintenance']);
  * - operator: stalls in their assigned building only
  */
 router.get('/',
-  authorizeRole('admin', 'operator'),
+  authorizeRole('admin', 'operator', 'biller', 'reader'),
   attachBuildingScope(),
   async (req, res) => {
     try {
     const stalls = await Stall.findAll({
       where: req.buildingWhere('building_id'),
     });
-      return res.json(stalls); // 200 with [] if none
+      return res.json(stalls);
     } catch (err) {
       console.error('Database error:', err);
       res.status(500).json({ error: err.message });

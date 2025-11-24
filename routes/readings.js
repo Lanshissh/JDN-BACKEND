@@ -401,7 +401,7 @@ router.get('/by-meter/:meter_id',
  * REQUIRED: image (base64/base64url/data URL/hex/Buffer). remarks optional.
  */
 router.post('/',
-  authorizeRole('admin', 'operator'),
+  authorizeRole('admin', 'operator', 'reader'),
   async (req, res) => {
     let { meter_id, reading_value, lastread_date, remarks, image } = req.body || {};
 
@@ -489,7 +489,7 @@ router.post('/',
  * remarks is optional; send null to clear remarks.
  */
 router.put('/:id',
-  authorizeRole('admin', 'operator'),
+  authorizeRole('admin', 'operator', 'reader'),
   async (req, res) => {
     const readingId = req.params.id;
     let { meter_id, reading_value, lastread_date, remarks, image } = req.body || {};
@@ -602,7 +602,7 @@ router.put('/:id',
  * Admin: any; Non-admin: only under their building.
  */
 router.delete('/:id',
-  authorizeRole('admin', 'operator'),
+  authorizeRole('admin', 'operator', 'reader'),
   async (req, res) => {
     const readingId = req.params.id;
     if (!readingId) {
