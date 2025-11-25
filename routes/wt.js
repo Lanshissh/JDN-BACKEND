@@ -35,7 +35,7 @@ function coerceWtNumbers(obj) {
  */
 
 /** GET /wt — list WT codes (optional ?q= on code/description) */
-router.get('/', authorizeRole('admin', 'biller'), async (req, res) => {
+router.get('/', authorizeRole('admin', 'biller', 'operator'), async (req, res) => {
   try {
     const q = (req.query.q || '').toString().trim();
     const where = q
@@ -56,7 +56,7 @@ router.get('/', authorizeRole('admin', 'biller'), async (req, res) => {
 });
 
 /** GET /wt/:wt_id — fetch a WT code by primary key */
-router.get('/:wt_id', authorizeRole('admin', 'biller'), async (req, res) => {
+router.get('/:wt_id', authorizeRole('admin', 'biller', 'operator'), async (req, res) => {
   try {
     const row = await WT.findByPk(req.params.wt_id);
     if (!row) return res.status(404).json({ error: 'WT record not found' });

@@ -133,7 +133,8 @@ router.get(
 router.get(
   '/:id',
   authorizeRole('admin', 'operator', 'biller', 'reader'),
-  authorizeBuildingParam(),
+  // IMPORTANT: :id is the building_id param
+  authorizeBuildingParam('params', 'id'),
   async (req, res) => {
     try {
       const building = await Building.findOne({ where: { building_id: req.params.id } });
@@ -219,7 +220,8 @@ router.post(
 router.put(
   '/:id',
   authorizeRole('admin'),
-  authorizeBuildingParam(),
+  // IMPORTANT: :id is the building_id param
+  authorizeBuildingParam('params', 'id'),
   async (req, res) => {
     try {
       const b = await Building.findOne({ where: { building_id: req.params.id } });
@@ -266,30 +268,61 @@ router.put(
 /**
  * GET /buildings/:id/base-rates
  * Read the set of base rates (includes markup_rate and penalty_rate).
- * Read access: admin, biller, reader, operator
+ * Read access: admin, biller, operator, reader
  */
 router.get(
-  '/:id/base-rates',
-  authorizeRole('admin', 'biller', 'operator', 'reader'),
-  authorizeBuildingParam(),
+  "/:id/base-rates",
+  authorizeRole("admin", "biller", "operator", "reader"),
   async (req, res) => {
     try {
+      const buildingId = String(req.params.id);
+
+      // Roles from JWT
+      const rawRoles = Array.isArray(req.user?.user_roles)
+        ? req.user.user_roles
+        : [];
+      const roles = rawRoles.map((r) => String(r).toLowerCase());
+      const isAdmin = roles.includes("admin");
+      const isBiller = roles.includes("biller");
+
+      // Building scope from JWT
+      const allowedBuildings = Array.isArray(req.user?.building_ids)
+        ? req.user.building_ids.map((id) => String(id))
+        : [];
+
+      // For operator/reader: enforce building_ids
+      if (!isAdmin && !isBiller) {
+        if (
+          !allowedBuildings.length ||
+          !allowedBuildings.includes(buildingId)
+        ) {
+          return res
+            .status(403)
+            .json({ error: "Not allowed to view base rates for this building." });
+        }
+      }
+
       const building = await Building.findOne({
-        where: { building_id: req.params.id },
+        where: { building_id: buildingId },
         attributes: [
-          'building_id',
-          'erate_perKwH', 'emin_con',
-          'wrate_perCbM', 'wmin_con',
-          'lrate_perKg',
-          'markup_rate',
-          'penalty_rate', // NEW: include penalty_rate
-          'last_updated', 'updated_by'
-        ]
+          "building_id",
+          "erate_perKwH",
+          "emin_con",
+          "wrate_perCbM",
+          "wmin_con",
+          "lrate_perKg",
+          "markup_rate",
+          "penalty_rate",
+        ],
       });
-      if (!building) return res.status(404).json({ message: 'Building not found' });
+
+      if (!building) {
+        return res.status(404).json({ message: "Building not found" });
+      }
+
       res.json(building);
     } catch (err) {
-      console.error('GET /buildings/:id/base-rates error:', err);
+      console.error("GET /buildings/:id/base-rates error:", err);
       res.status(500).json({ error: err.message });
     }
   }
@@ -303,8 +336,9 @@ router.get(
  */
 router.put(
   '/:id/base-rates',
-  authorizeRole('admin', 'biller'),
-  authorizeBuildingParam(),
+  authorizeRole('admin', 'biller', 'operator'),
+  // IMPORTANT: :id is the building_id param
+  authorizeBuildingParam('params', 'id'),
   async (req, res) => {
     try {
       const building = await Building.findOne({ where: { building_id: req.params.id } });
@@ -358,7 +392,7 @@ router.put(
           'wrate_perCbM', 'wmin_con',
           'lrate_perKg',
           'markup_rate',
-          'penalty_rate', // NEW: include penalty_rate
+          'penalty_rate', // include penalty_rate
           'last_updated', 'updated_by'
         ]
       });

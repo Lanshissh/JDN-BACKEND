@@ -37,7 +37,7 @@ function coerceVatNumbers(obj) {
  */
 
 /** GET /vat — list VAT codes (optional ?q= on code/description) */
-router.get('/', authorizeRole('admin', 'biller'), async (req, res) => {
+router.get('/', authorizeRole('admin', 'biller', 'operator'), async (req, res) => {
   try {
     const q = (req.query.q || '').toString().trim();
     const where = q
@@ -58,7 +58,7 @@ router.get('/', authorizeRole('admin', 'biller'), async (req, res) => {
 });
 
 /** GET /vat/:tax_id — fetch a VAT code by primary key */
-router.get('/:tax_id', authorizeRole('admin', 'biller'), async (req, res) => {
+router.get('/:tax_id', authorizeRole('admin', 'biller', 'operator'), async (req, res) => {
   try {
     const row = await VAT.findByPk(req.params.tax_id);
     if (!row) return res.status(404).json({ error: 'VAT record not found' });
@@ -173,7 +173,7 @@ router.delete('/:tax_id', authorizeRole('admin', 'biller'), async (req, res) => 
  */
 router.get(
   '/buildings/:building_id/tenants',
-  authorizeRole('admin', 'biller'),
+  authorizeRole('admin', 'biller', 'operator'),
   authorizeBuildingParam(), // non-admin must match :building_id
   async (req, res) => {
     try {
