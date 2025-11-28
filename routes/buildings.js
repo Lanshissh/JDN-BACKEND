@@ -1,9 +1,7 @@
-// routes/buildings.js
 const express = require('express');
 const router = express.Router();
 
 const { Op } = require('sequelize');
-
 // Models
 const Building = require('../models/Building');
 
