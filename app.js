@@ -18,6 +18,9 @@ var wtsRouter = require('./routes/wt');
 var buildingsRouter = require('./routes/buildings');
 var billingsRouter = require('./routes/billings');
 var rocRouter = require('./routes/rateofchange');
+var readerRouter  = require('./routes/readerDevices');
+var offlineRouter  = require('./routes/offlineExport');
+
 
 // Sequelize setup
 const sequelize = require('./models');
@@ -46,6 +49,9 @@ app.use('/wt', wtsRouter);
 app.use('/buildings', buildingsRouter);
 app.use('/billings', billingsRouter);
 app.use('/roc', rocRouter);
+app.use("/reader-devices", readerRouter);
+app.use("/offlineExport", offlineRouter);
+
 
 
 // catch 404 and forward to error handler
