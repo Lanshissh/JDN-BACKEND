@@ -1,4 +1,3 @@
-// routes/rateofchange.js (only the changed routes shown)
 'use strict';
 
 const express = require('express');
