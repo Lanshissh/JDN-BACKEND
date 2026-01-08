@@ -1,3 +1,4 @@
+// routes/readerDevices.js
 const express = require("express");
 const crypto = require("crypto");
 const router = express.Router();
@@ -6,33 +7,20 @@ const authenticateToken = require("../middleware/authenticateToken");
 const authorizeRole = require("../middleware/authorizeRole");
 const sequelize = require("../models");
 
-/**
- * DEVICE MODEL (reader_devices) expected columns:
- * device_id (PK int identity)
- * device_serial (varchar unique not null)
- * device_name (varchar null)
- * device_info (varchar null)
- * device_token (varchar unique not null)
- * status ('active'|'blocked')
- * created_at (datetime default)
- * last_used_at (datetime null)
- */
-
 function generateToken() {
   return crypto.randomBytes(24).toString("hex"); // 48 chars
 }
 
-/**
- * Rare but possible: token collision because device_token is UNIQUE.
- * We'll retry a few times.
- */
 async function generateUniqueToken(maxTries = 5) {
   for (let i = 0; i < maxTries; i++) {
     const token = generateToken();
+
+    // ✅ MSSQL-safe
     const [rows] = await sequelize.query(
-      `SELECT device_id FROM reader_devices WHERE device_token = ?`,
+      `SELECT device_id FROM reader_devices WHERE device_token = @p0`,
       { replacements: [token] }
     );
+
     if (!rows || rows.length === 0) return token;
   }
   throw new Error("Failed to generate unique device token");
@@ -54,9 +42,9 @@ router.post("/", authenticateToken, authorizeRole("admin"), async (req, res) => 
     const name = String(device_name).trim();
     const info = device_info ? String(device_info).trim() : null;
 
-    // Prevent duplicates by serial
+    // ✅ MSSQL-safe
     const [existing] = await sequelize.query(
-      `SELECT device_id FROM reader_devices WHERE device_serial = ?`,
+      `SELECT device_id FROM reader_devices WHERE device_serial = @p0`,
       { replacements: [serial] }
     );
     if (existing && existing.length > 0) {
@@ -65,26 +53,26 @@ router.post("/", authenticateToken, authorizeRole("admin"), async (req, res) => 
 
     const device_token = await generateUniqueToken();
 
-    // created_at default exists in DB, but keeping explicit is OK; use SYSUTCDATETIME
+    // ✅ MSSQL-safe insert
     await sequelize.query(
       `
-        INSERT INTO reader_devices
-          (device_serial, device_name, device_info, device_token, status, created_at)
-        VALUES
-          (?, ?, ?, ?, 'active', SYSUTCDATETIME())
+      INSERT INTO reader_devices
+        (device_serial, device_name, device_info, device_token, status, created_at)
+      VALUES
+        (@p0, @p1, @p2, @p3, 'active', SYSUTCDATETIME())
       `,
       { replacements: [serial, name, info, device_token] }
     );
 
     const [rows] = await sequelize.query(
-      `SELECT * FROM reader_devices WHERE device_serial = ?`,
+      `SELECT * FROM reader_devices WHERE device_serial = @p0`,
       { replacements: [serial] }
     );
 
-    return res.status(201).json(rows[0]);
+    return res.status(201).json(rows?.[0] || null);
   } catch (err) {
     console.error("readerDevices POST / error:", err);
-    return res.status(500).json({ error: "server error" });
+    return res.status(500).json({ error: err?.message || "server error" });
   }
 });
 
@@ -102,7 +90,7 @@ router.post("/resolve", authenticateToken, async (req, res) => {
     const name = device_name ? String(device_name).trim() : null;
 
     const [rows] = await sequelize.query(
-      `SELECT * FROM reader_devices WHERE device_serial = ?`,
+      `SELECT * FROM reader_devices WHERE device_serial = @p0`,
       { replacements: [serial] }
     );
 
@@ -111,46 +99,44 @@ router.post("/resolve", authenticateToken, async (req, res) => {
     }
 
     const device = rows[0];
-    if (device.status !== "active") {
+    if (String(device.status).toLowerCase() !== "active") {
       return res.status(403).json({ error: "Device is blocked" });
     }
 
-    // update last used + optional info/name (only if provided)
     await sequelize.query(
       `
-        UPDATE reader_devices
-        SET
-          last_used_at = SYSUTCDATETIME(),
-          device_info = COALESCE(?, device_info),
-          device_name = COALESCE(?, device_name)
-        WHERE device_id = ?
+      UPDATE reader_devices
+      SET
+        last_used_at = SYSUTCDATETIME(),
+        device_info = COALESCE(@p0, device_info),
+        device_name = COALESCE(@p1, device_name)
+      WHERE device_id = @p2
       `,
       { replacements: [info, name, device.device_id] }
     );
 
     const [updated] = await sequelize.query(
-      `SELECT * FROM reader_devices WHERE device_id = ?`,
+      `SELECT * FROM reader_devices WHERE device_id = @p0`,
       { replacements: [device.device_id] }
     );
 
-    // Return full row (admin/reader both can use it)
-    return res.json(updated[0]);
+    return res.json(updated?.[0] || null);
   } catch (err) {
     console.error("readerDevices POST /resolve error:", err);
-    return res.status(500).json({ error: "server error" });
+    return res.status(500).json({ error: err?.message || "server error" });
   }
 });
 
-// ✅ 3) Admin list of all devices
+// ✅ 3) Admin list of all devices (THIS is what the UI needs)
 router.get("/", authenticateToken, authorizeRole("admin"), async (_req, res) => {
   try {
     const [rows] = await sequelize.query(
-      "SELECT * FROM reader_devices ORDER BY device_id DESC"
+      `SELECT * FROM reader_devices ORDER BY device_id DESC`
     );
-    return res.json(rows);
+    return res.json(rows || []);
   } catch (err) {
     console.error("readerDevices GET / error:", err);
-    return res.status(500).json({ error: "server error" });
+    return res.status(500).json({ error: err?.message || "server error" });
   }
 });
 
@@ -162,19 +148,22 @@ router.patch(
   async (req, res) => {
     try {
       const { status } = req.body || {};
-      const { device_id } = req.params;
+      const device_id = Number(req.params.device_id);
 
-      if (!["active", "blocked"].includes(status)) {
+      if (!Number.isFinite(device_id)) {
+        return res.status(400).json({ error: "invalid device_id" });
+      }
+      if (!["active", "blocked"].includes(String(status))) {
         return res.status(400).json({ error: "invalid status" });
       }
 
       await sequelize.query(
-        "UPDATE reader_devices SET status = ? WHERE device_id = ?",
+        `UPDATE reader_devices SET status = @p0 WHERE device_id = @p1`,
         { replacements: [status, device_id] }
       );
 
       const [rows] = await sequelize.query(
-        "SELECT * FROM reader_devices WHERE device_id = ?",
+        `SELECT * FROM reader_devices WHERE device_id = @p0`,
         { replacements: [device_id] }
       );
 
@@ -185,7 +174,7 @@ router.patch(
       return res.json(rows[0]);
     } catch (err) {
       console.error("readerDevices PATCH /:id/status error:", err);
-      return res.status(500).json({ error: "server error" });
+      return res.status(500).json({ error: err?.message || "server error" });
     }
   }
 );
@@ -197,24 +186,29 @@ router.delete(
   authorizeRole("admin"),
   async (req, res) => {
     try {
-      const { device_id } = req.params;
+      const device_id = Number(req.params.device_id);
+
+      if (!Number.isFinite(device_id)) {
+        return res.status(400).json({ error: "invalid device_id" });
+      }
 
       const [rows] = await sequelize.query(
-        "SELECT * FROM reader_devices WHERE device_id = ?",
+        `SELECT * FROM reader_devices WHERE device_id = @p0`,
         { replacements: [device_id] }
       );
       if (!rows || rows.length === 0) {
         return res.status(404).json({ error: "Device not found" });
       }
 
-      await sequelize.query("DELETE FROM reader_devices WHERE device_id = ?", {
-        replacements: [device_id],
-      });
+      await sequelize.query(
+        `DELETE FROM reader_devices WHERE device_id = @p0`,
+        { replacements: [device_id] }
+      );
 
-      return res.json({ success: true, deleted_id: Number(device_id) });
+      return res.json({ success: true, deleted_id: device_id });
     } catch (err) {
       console.error("readerDevices DELETE /:id error:", err);
-      return res.status(500).json({ error: "server error" });
+      return res.status(500).json({ error: err?.message || "server error" });
     }
   }
 );
