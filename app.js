@@ -18,19 +18,25 @@ var wtsRouter = require('./routes/wt');
 var buildingsRouter = require('./routes/buildings');
 var billingsRouter = require('./routes/billings');
 var rocRouter = require('./routes/rateofchange');
+var rDevicesRouter = require('./routes/readerDevices');
+var offlineExportRouter = require('./routes/offlineExport');
 
 // Sequelize setup
 const sequelize = require('./models');
-sequelize.authenticate()
+sequelize
+  .authenticate()
   .then(() => console.log('Sequelize connected to MSSQL!'))
-  .catch(err => console.error('Unable to connect to DB via Sequelize:', err));
+  .catch((err) => console.error('Unable to connect to DB via Sequelize:', err));
 
 var app = express();
 
 app.use(cors());
 app.use(logger('dev'));
-app.use(express.json());
-app.use(express.urlencoded({ extended: false }));
+
+// (optional but recommended) allow larger image payloads from offline export
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ extended: false, limit: '50mb' }));
+
 app.use(cookieParser());
 app.use(express.static(path.join(__dirname, 'public')));
 
@@ -47,17 +53,24 @@ app.use('/buildings', buildingsRouter);
 app.use('/billings', billingsRouter);
 app.use('/roc', rocRouter);
 
+// ✅ FIX: mount Reader Devices where your frontend expects it
+app.use('/reader-devices', rDevicesRouter);
+
+// ✅ keep old path as alias (so older builds won't break)
+app.use('/readerDevices', rDevicesRouter);
+
+app.use('/offlineExport', offlineExportRouter);
 
 // catch 404 and forward to error handler
-app.use(function(req, res, next) {
+app.use(function (req, res, next) {
   next(createError(404));
 });
 
 // error handler
-app.use(function(err, req, res, next) {
+app.use(function (err, req, res, next) {
   res.status(err.status || 500).json({
     message: err.message,
-    error: req.app.get('env') === 'development' ? err : {}
+    error: req.app.get('env') === 'development' ? err : {},
   });
 });
 
