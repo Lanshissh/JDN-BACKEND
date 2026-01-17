@@ -14,6 +14,7 @@ router.use(authenticateToken);
 // ---------------- HELPERS ----------------
 
 function getUserId(req) {
+  // Keep as-is; we will stringify where needed
   return req.user?.user_id || req.user?.id || null;
 }
 
@@ -61,19 +62,6 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
     const { device_token } = req.body;
     const device = await requireActiveDevice(device_token);
 
-    /**
-     * Package items must include:
-     * - tenant_name
-     * - meter_id + meter_sn
-     * - classification: electric/water/lpg  (we map from meter_type)
-     * - stall_id
-     * - prev reading + prev date
-     * - prev image (optional)
-     * - qr payload (meter_id)
-     *
-     * NOTE: This query joins meter -> stall -> tenant
-     * and pulls latest previous reading (OUTER APPLY).
-     */
     const items = await sequelize.query(
       `
       SELECT
@@ -149,8 +137,13 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
     const { device_token, readings } = req.body;
     const device = await requireActiveDevice(device_token);
 
-    const reader_id = getUserId(req);
-    if (!reader_id) return res.status(400).json({ error: "Invalid user token" });
+    // IMPORTANT:
+    // dbo.offline_submissions.reader_user_id is NOW NVARCHAR
+    // so we store the user id as a STRING.
+    const reader_id = String(getUserId(req) || "").trim();
+    if (!reader_id) {
+      return res.status(400).json({ error: "Invalid user token" });
+    }
 
     if (!Array.isArray(readings) || readings.length === 0) {
       return res.status(400).json({ error: "No readings provided" });
@@ -159,9 +152,31 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
     let count = 0;
 
     for (const r of readings) {
-      if (!r.meter_id || !r.lastread_date) {
+      if (!r || !r.meter_id || !r.lastread_date) {
         return res.status(400).json({ error: "Invalid reading payload" });
       }
+
+      // meter_id in your system is NVARCHAR (e.g., "MTR-1")
+      const meter_id = String(r.meter_id).trim();
+
+      // Ensure reading_value becomes a number for DECIMAL(18,4)
+      const reading_value =
+        r.reading_value === null ||
+        r.reading_value === undefined ||
+        r.reading_value === ""
+          ? null
+          : Number(r.reading_value);
+
+      if (reading_value !== null && !Number.isFinite(reading_value)) {
+        return res.status(400).json({
+          error: `Invalid reading_value for meter ${meter_id}. Got: ${String(
+            r.reading_value
+          )}`,
+        });
+      }
+
+      // SQL DATE expects YYYY-MM-DD; if you send ISO, slice to date part
+      const reading_date = String(r.lastread_date).slice(0, 10);
 
       await sequelize.query(
         `
@@ -174,11 +189,11 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
         `,
         {
           replacements: {
-            device_id: device.id,
-            reader_user_id: reader_id,
-            meter_id: r.meter_id,
-            reading_value: r.reading_value,
-            reading_date: r.lastread_date,
+            device_id: device.id, // INT
+            reader_user_id: reader_id, // NVARCHAR
+            meter_id, // NVARCHAR
+            reading_value, // DECIMAL(18,4)
+            reading_date, // DATE
             remarks: r.remarks || null,
             image: r.image || null,
           },
@@ -237,7 +252,13 @@ router.get("/pending", authorizeRole("admin"), async (_req, res) => {
 router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const admin_id = getUserId(req);
+
+    // IMPORTANT:
+    // dbo.offline_submissions.approved_by is NOW NVARCHAR
+    const admin_id = String(getUserId(req) || "").trim();
+    if (!admin_id) {
+      return res.status(400).json({ error: "Invalid admin token" });
+    }
 
     const rows = await sequelize.query(
       `SELECT * FROM dbo.offline_submissions WHERE id = :id`,
@@ -251,6 +272,10 @@ router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
       return res.status(400).json({ error: "Already processed" });
     }
 
+    // NOTE:
+    // This will succeed as long as dbo.meter_reading.read_by accepts the same type
+    // as s.reader_user_id (string). If dbo.meter_reading.read_by is still INT,
+    // you'll need to ALTER it to NVARCHAR too.
     await sequelize.query(
       `
       INSERT INTO dbo.meter_reading
@@ -304,7 +329,12 @@ router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
 router.post("/reject/:id", authorizeRole("admin"), async (req, res) => {
   try {
     const id = Number(req.params.id);
-    const admin_id = getUserId(req);
+
+    // dbo.offline_submissions.approved_by is NOW NVARCHAR
+    const admin_id = String(getUserId(req) || "").trim();
+    if (!admin_id) {
+      return res.status(400).json({ error: "Invalid admin token" });
+    }
 
     await sequelize.query(
       `
