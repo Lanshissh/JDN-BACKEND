@@ -106,16 +106,21 @@ function getUserBuildingId(req) {
 
 // Resolve building_id for a meter
 async function getMeterBuildingId(meterId) {
-  const meter = await Meter.findOne({ where: { meter_id: meterId }, attributes: ['stall_id', 'building_id'], raw: true });
-  if (!meter) return null;
+  // ✅ Meter table doesn't have building_id in your DB; only read stall_id
+  const meter = await Meter.findOne({
+    where: { meter_id: meterId },
+    attributes: ['stall_id'],
+    raw: true
+  });
+  if (!meter || !meter.stall_id) return null;
 
-  if (meter.building_id) return meter.building_id; // prefer direct if present
+  const stall = await Stall.findOne({
+    where: { stall_id: meter.stall_id },
+    attributes: ['building_id'],
+    raw: true
+  });
 
-  if (meter.stall_id) {
-    const stall = await Stall.findOne({ where: { stall_id: meter.stall_id }, attributes: ['building_id'], raw: true });
-    return stall?.building_id || null;
-  }
-  return null;
+  return stall?.building_id || null;
 }
 
 // Resolve building_id for a reading
@@ -354,7 +359,8 @@ router.get('/by-meter/:meter_id',
     const { from, to, order = 'DESC', limit, offset } = req.query || {};
 
     try {
-      const meter = await Meter.findOne({ where: { meter_id: meterId }, attributes: ['stall_id', 'building_id'], raw: true });
+      // ✅ Meter table doesn't have building_id in your DB; only read stall_id
+      const meter = await Meter.findOne({ where: { meter_id: meterId }, attributes: ['stall_id'], raw: true });
       if (!meter) return res.status(404).json({ error: 'Meter not found' });
 
       if (!isAdmin(req)) {
@@ -469,7 +475,7 @@ router.post('/',
         last_updated: now,
         updated_by:   updatedBy,
         remarks:      (remarks ?? null),
-        image:        imageBuf 
+        image:        imageBuf
       };
 
       await Reading.create(payload);

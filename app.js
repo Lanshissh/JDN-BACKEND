@@ -47,6 +47,7 @@ app.use('/tenants', tenantsRouter);
 app.use('/stalls', stallsRouter);
 app.use('/meters', meterRouter);
 app.use('/readings', readingsRouter);
+app.use('/meter_reading', readingsRouter);
 app.use('/vat', vatsRouter);
 app.use('/wt', wtsRouter);
 app.use('/buildings', buildingsRouter);

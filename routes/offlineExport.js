@@ -62,6 +62,18 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
     const { device_token } = req.body;
     const device = await requireActiveDevice(device_token);
 
+    /**
+     * Package items include:
+     * - tenant_name
+     * - meter_id + meter_sn
+     * - classification: electric/water/lpg  (we map from meter_type)
+     * - stall_id
+     * - prev reading + prev date (+ prev2 reading/date)
+     * - prev image (+ prev2 image)
+     * - qr payload (meter_id)
+     *
+     * NOTE: pulls latest previous reading + 2nd latest (OUTER APPLY)
+     */
     const items = await sequelize.query(
       `
       SELECT
@@ -80,10 +92,15 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
         -- Tenant name (via stall -> tenant)
         t.tenant_name,
 
-        -- Previous reading snapshot (latest)
-        lr.reading_value AS prev_reading,
-        lr.lastread_date AS prev_date,
-        lr.image AS prev_image,
+        -- Latest previous reading snapshot
+        lr1.reading_value AS prev_reading,
+        lr1.lastread_date AS prev_date,
+        lr1.image AS prev_image,
+
+        -- 2nd latest previous reading snapshot
+        lr2.reading_value AS prev2_reading,
+        lr2.lastread_date AS prev2_date,
+        lr2.image AS prev2_image,
 
         -- QR payload (your QR is meter_id)
         m.meter_id AS qr
@@ -97,7 +114,16 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
         FROM dbo.meter_reading
         WHERE meter_id = m.meter_id
         ORDER BY lastread_date DESC
-      ) lr
+      ) lr1
+
+      OUTER APPLY (
+        SELECT TOP 1 reading_value, lastread_date, image
+        FROM dbo.meter_reading
+        WHERE meter_id = m.meter_id
+          AND lr1.lastread_date IS NOT NULL
+          AND lastread_date < lr1.lastread_date
+        ORDER BY lastread_date DESC
+      ) lr2
 
       ORDER BY m.meter_id ASC
       `,
@@ -109,15 +135,21 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
         generated_at: new Date().toISOString(),
         device_serial: device.device_serial || null,
         device_name: device.device_name || null,
-        items: items.map((x) => ({
+        items: (items || []).map((x) => ({
           meter_id: x.meter_id,
           stall_id: x.stall_id ?? null,
           meter_number: x.meter_sn ?? null,
           tenant_name: x.tenant_name ?? null,
           classification: x.classification ?? null,
+
           prev_reading: x.prev_reading ?? null,
           prev_date: x.prev_date ?? null,
           prev_image: x.prev_image ?? null,
+
+          prev2_reading: x.prev2_reading ?? null,
+          prev2_date: x.prev2_date ?? null,
+          prev2_image: x.prev2_image ?? null,
+
           qr: x.qr ?? x.meter_id,
         })),
       },
@@ -137,9 +169,7 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
     const { device_token, readings } = req.body;
     const device = await requireActiveDevice(device_token);
 
-    // IMPORTANT:
-    // dbo.offline_submissions.reader_user_id is NOW NVARCHAR
-    // so we store the user id as a STRING.
+    // Store user id as STRING (safe even if user_id is like "USR-1")
     const reader_id = String(getUserId(req) || "").trim();
     if (!reader_id) {
       return res.status(400).json({ error: "Invalid user token" });
@@ -156,10 +186,8 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
         return res.status(400).json({ error: "Invalid reading payload" });
       }
 
-      // meter_id in your system is NVARCHAR (e.g., "MTR-1")
       const meter_id = String(r.meter_id).trim();
 
-      // Ensure reading_value becomes a number for DECIMAL(18,4)
       const reading_value =
         r.reading_value === null ||
         r.reading_value === undefined ||
@@ -175,7 +203,7 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
         });
       }
 
-      // SQL DATE expects YYYY-MM-DD; if you send ISO, slice to date part
+      // SQL DATE expects YYYY-MM-DD
       const reading_date = String(r.lastread_date).slice(0, 10);
 
       await sequelize.query(
@@ -192,7 +220,7 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
             device_id: device.id, // INT
             reader_user_id: reader_id, // NVARCHAR
             meter_id, // NVARCHAR
-            reading_value, // DECIMAL(18,4)
+            reading_value, // DECIMAL
             reading_date, // DATE
             remarks: r.remarks || null,
             image: r.image || null,
@@ -253,8 +281,6 @@ router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    // IMPORTANT:
-    // dbo.offline_submissions.approved_by is NOW NVARCHAR
     const admin_id = String(getUserId(req) || "").trim();
     if (!admin_id) {
       return res.status(400).json({ error: "Invalid admin token" });
@@ -272,10 +298,6 @@ router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
       return res.status(400).json({ error: "Already processed" });
     }
 
-    // NOTE:
-    // This will succeed as long as dbo.meter_reading.read_by accepts the same type
-    // as s.reader_user_id (string). If dbo.meter_reading.read_by is still INT,
-    // you'll need to ALTER it to NVARCHAR too.
     await sequelize.query(
       `
       INSERT INTO dbo.meter_reading
@@ -330,7 +352,6 @@ router.post("/reject/:id", authorizeRole("admin"), async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    // dbo.offline_submissions.approved_by is NOW NVARCHAR
     const admin_id = String(getUserId(req) || "").trim();
     if (!admin_id) {
       return res.status(400).json({ error: "Invalid admin token" });
