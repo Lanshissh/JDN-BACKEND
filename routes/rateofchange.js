@@ -1,4 +1,4 @@
-// routes/rateofchange.js (only the changed routes shown)
+// routes/rateofchange.js
 'use strict';
 
 const express = require('express');
@@ -7,6 +7,7 @@ const { Op } = require('sequelize');
 
 const authenticateToken = require('../middleware/authenticateToken');
 const authorizeRole     = require('../middleware/authorizeRole');
+const authorizeAccess   = require('../middleware/authorizeAccess'); // ✅ NEW
 const authorizeUtilityRole = require('../middleware/authorizeUtilityRole');
 const {
   authorizeBuildingParam,
@@ -33,6 +34,7 @@ const {
 
 /* Middleware */
 router.use(authenticateToken);
+router.use(authorizeAccess('rate_of_change')); // ✅ NEW
 
 /** ========== PER-METER ========== */
 router.get(
@@ -216,7 +218,6 @@ router.get(
     }
   }
 );
-
 
 /** ========== PER-BUILDING utility totals in the window (calendar-month baseline) ========== */
 router.get(

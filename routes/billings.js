@@ -7,6 +7,7 @@ const router = express.Router();
 // Middlewares
 const authenticateToken   = require('../middleware/authenticateToken');
 const authorizeRole       = require('../middleware/authorizeRole');
+const authorizeAccess     = require('../middleware/authorizeAccess'); // ✅ NEW
 const authorizeUtility    = require('../middleware/authorizeUtilityRole');
 const {
   attachBuildingScope,
@@ -37,6 +38,7 @@ const { computeROCForMeter } = require('../utils/rocUtils');
 
 // Require auth for all billing routes
 router.use(authenticateToken);
+router.use(authorizeAccess('billing')); // ✅ NEW
 
 /** Resolve building_id for a given meter_id (for enforceRecordBuilding) */
 async function resolveBuildingForMeter(req) {
@@ -167,11 +169,8 @@ router.get(
         return res.status(403).json({ error: 'Not allowed to view this building billing.' });
       }
 
-      // payload_json already has the full snapshot we saved in the POST
-      // via the Billing model getter this is already parsed JSON
       const snapshot = header.payload_json || {};
 
-      // Fallbacks in case payload_json was null/empty
       const building_id  = snapshot.building_id || header.building_id;
       const period_start = snapshot?.period?.start || header.period_start;
       const period_end   = snapshot?.period?.end   || header.period_end;
@@ -183,14 +182,12 @@ router.get(
 
       const tenants = snapshot.tenants || [];
 
-      // Prefer the original generated_at in snapshot; otherwise use DB value
       const generated_at =
         snapshot.generated_at ||
         (header.generated_at
           ? header.generated_at.toISOString().slice(0, 19).replace('T', ' ')
           : null);
 
-      // Return the same shape as before, plus a few extras
       res.json({
         building_billing_id: header.building_billing_id,
         building_id,
@@ -228,7 +225,6 @@ router.post(
         return res.status(400).json({ error: 'Invalid date(s). Use YYYY-MM-DD.' });
       }
 
-      // Get building to retrieve penalty_rate
       const building = await Building.findOne({
         where: { building_id },
         attributes: ['building_name', 'penalty_rate'],
@@ -241,7 +237,6 @@ router.post(
       const buildingName = building?.building_name || null;
       const penaltyRatePct = Number(building.penalty_rate) || 0;
 
-      // ---- SAME COMPUTE LOGIC AS YOUR GET ----
       const { meters } = await computeBillingForBuilding({
         buildingId: building_id,
         startDate,
@@ -265,7 +260,6 @@ router.post(
         let rate_of_change_pct = null;
         let prev_consumed_kwh  = null;
         try {
-          // same custom window for ROC
           const roc = await computeROCForMeter({ meterId, startDate, endDate });
           rate_of_change_pct = roc?.rate_of_change ?? null;
           prev_consumed_kwh  = roc?.previous_consumption ?? null;
@@ -283,8 +277,8 @@ router.post(
         const markupRate  = entry?.billing?.rates?.markup_rate ?? null;
         const systemRate  = entry?.billing?.rates?.system_rate ?? (consumed > 0 ? +(base / consumed).toFixed(6) : null);
         const vatRate     = base > 0 ? +(vat / base).toFixed(4) : null;
-        const wtRate      = entry?.billing?.rates?.wt_rate ?? null; // ADD wt_rate
-        const penaltyRate = entry?.billing?.rates?.penalty_rate ?? null; // ADD penalty_rate
+        const wtRate      = entry?.billing?.rates?.wt_rate ?? null;
+        const penaltyRate = entry?.billing?.rates?.penalty_rate ?? null;
 
         rows.push({
           stall_no: stallNo,
@@ -302,8 +296,8 @@ router.post(
           markup_rate: markupRate,
           system_rate: systemRate,
           vat_rate: vatRate,
-          wt_rate: wtRate, // ADD wt_rate to output
-          penalty_rate: penaltyRate, // ADD penalty_rate to output
+          wt_rate: wtRate,
+          penalty_rate: penaltyRate,
           total_amount: totalAmt,
           prev_consumed_kwh: prev_consumed_kwh,
           rate_of_change_pct: rate_of_change_pct,
@@ -314,7 +308,6 @@ router.post(
         });
       }
 
-      // ---- group by tenant (same as GET) ----
       const tenantsMap = new Map();
       for (const r of rows) {
         const tkey = `${r.tenant_name ?? 'UNKNOWN'}::${r.tenant_id ?? 'NA'}`;
@@ -341,9 +334,8 @@ router.post(
       totals.total_consumed_kwh = +totals.total_consumed_kwh.toFixed(2);
       totals.total_amount       = +totals.total_amount.toFixed(2);
 
-      const generated_at = getCurrentDateTime(); // for API output (string is fine)
+      const generated_at = getCurrentDateTime();
 
-      // This matches your Postman output shape
       const payload = {
         building_id,
         period: { start: startDate, end: endDate },
@@ -352,10 +344,8 @@ router.post(
         generated_at,
       };
 
-      // ---- SAVE HEADER TO billing_list (one row per building+period) ----
       const building_billing_id = `${building_id}-${startDate}-${endDate}`;
 
-      // uniqueness check
       const existing = await Billing.findOne({
         where: {
           building_id,
@@ -382,13 +372,12 @@ router.post(
         total_consumed_kwh: totals.total_consumed_kwh,
         total_amount: totals.total_amount,
         penalty_rate_pct: penaltyRatePct,
-        payload_json: payload, // model setter will JSON.stringify
-        generated_at: now,     // DB datetime
+        payload_json: payload,
+        generated_at: now,
         last_updated: now,
         updated_by: req.user?.user_id || req.user?.username || 'system',
       });
 
-      // ---- RESPONSE ----
       res.status(201).json({
         ...payload,
         building_billing_id,
@@ -400,9 +389,6 @@ router.post(
     }
   }
 );
-
-
-
 
 /* =============================================================================
  * BUILDING (with markup) — grouped by tenant; show system_rate & markup_rate

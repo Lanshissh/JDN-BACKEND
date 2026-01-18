@@ -6,11 +6,13 @@ const { Op } = require('sequelize');
 const getCurrentDateTime = require('../utils/getCurrentDateTime');
 const authenticateToken = require('../middleware/authenticateToken');
 const authorizeRole = require('../middleware/authorizeRole');
+const authorizeAccess = require('../middleware/authorizeAccess'); // ✅ NEW
 
 const WT = require('../models/WT');
 
 // All routes require login (same concept as rates.js)
 router.use(authenticateToken);
+router.use(authorizeAccess('withholding')); // ✅ NEW
 
 /** helper: coerce numeric WT fields to DECIMAL(10,2) */
 function coerceWtNumbers(obj) {
@@ -22,17 +24,11 @@ function coerceWtNumbers(obj) {
       if (!Number.isFinite(n) || n < 0) {
         return { ok: false, error: `${k} must be a non-negative number` };
       }
-      // round to 2 decimals (e.g., 12.00 for 12%)
       out[k] = Math.round(n * 100) / 100;
     }
   }
   return { ok: true, data: out };
 }
-
-/** =========================
- *  WT CODE CATALOG (GLOBAL)
- *  =========================
- */
 
 /** GET /wt — list WT codes (optional ?q= on code/description) */
 router.get('/', authorizeRole('admin', 'biller', 'operator'), async (req, res) => {
@@ -75,11 +71,9 @@ router.post('/', authorizeRole('admin', 'biller'), async (req, res) => {
       return res.status(400).json({ error: 'wt_code is required' });
     }
 
-    // coerce numbers (percent points)
     const coerced = coerceWtNumbers({ e_wt, w_wt, l_wt });
     if (!coerced.ok) return res.status(400).json({ error: coerced.error });
 
-    // Generate next WT-<n> (cross-dialect; MSSQL-safe)
     const rows = await WT.findAll({
       where: { wt_id: { [Op.like]: 'WT-%' } },
       attributes: ['wt_id'],
@@ -112,7 +106,6 @@ router.post('/', authorizeRole('admin', 'biller'), async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-
 
 /** PUT /wt/:wt_id — update a WT code (admin & biller) */
 router.put('/:wt_id', authorizeRole('admin', 'biller'), async (req, res) => {

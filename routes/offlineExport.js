@@ -6,20 +6,25 @@ const { QueryTypes } = require("sequelize");
 
 const authenticateToken = require("../middleware/authenticateToken");
 const authorizeRole = require("../middleware/authorizeRole");
+const authorizeAccess = require("../middleware/authorizeAccess");
 const sequelize = require("../models");
 
 const router = express.Router();
+
 router.use(authenticateToken);
+
+// ✅ Allow either permission:
+// - readers need meter_readings to import/export
+// - approvers may have offline_submissions (UI) which implies meter_readings (users.js fix)
+router.use(authorizeAccess(["meter_readings", "offline_submissions"]));
 
 // ---------------- HELPERS ----------------
 
 function getUserId(req) {
-  // Keep as-is; we will stringify where needed
   return req.user?.user_id || req.user?.id || null;
 }
 
 function generateReadingId() {
-  // example: R-20260114-8F3A9C
   return (
     "R-" +
     new Date().toISOString().slice(0, 10).replace(/-/g, "") +
@@ -54,26 +59,12 @@ async function requireActiveDevice(device_token) {
 }
 
 // ---------------- READER IMPORT ----------------
-// Reader presses Sync (IMPORT). Device must get a LIGHTWEIGHT package only.
 // POST /offlineExport/import { device_token }
-
 router.post("/import", authorizeRole("reader"), async (req, res) => {
   try {
     const { device_token } = req.body;
     const device = await requireActiveDevice(device_token);
 
-    /**
-     * Package items include:
-     * - tenant_name
-     * - meter_id + meter_sn
-     * - classification: electric/water/lpg  (we map from meter_type)
-     * - stall_id
-     * - prev reading + prev date (+ prev2 reading/date)
-     * - prev image (+ prev2 image)
-     * - qr payload (meter_id)
-     *
-     * NOTE: pulls latest previous reading + 2nd latest (OUTER APPLY)
-     */
     const items = await sequelize.query(
       `
       SELECT
@@ -81,7 +72,6 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
         m.stall_id,
         m.meter_sn,
 
-        -- Classification mapping from meter_type
         CASE
           WHEN LOWER(m.meter_type) LIKE '%electric%' OR LOWER(m.meter_type) LIKE '%power%' THEN 'electric'
           WHEN LOWER(m.meter_type) LIKE '%water%' THEN 'water'
@@ -89,20 +79,16 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
           ELSE ISNULL(m.meter_type, 'unknown')
         END AS classification,
 
-        -- Tenant name (via stall -> tenant)
         t.tenant_name,
 
-        -- Latest previous reading snapshot
         lr1.reading_value AS prev_reading,
         lr1.lastread_date AS prev_date,
         lr1.image AS prev_image,
 
-        -- 2nd latest previous reading snapshot
         lr2.reading_value AS prev2_reading,
         lr2.lastread_date AS prev2_date,
         lr2.image AS prev2_image,
 
-        -- QR payload (your QR is meter_id)
         m.meter_id AS qr
 
       FROM dbo.meter_list m
@@ -161,15 +147,12 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
 });
 
 // ---------------- READER EXPORT ----------------
-// Reader presses Sync again (EXPORT). Upload readings to offline_submissions.
 // POST /offlineExport/export { device_token, readings: [...] }
-
 router.post("/export", authorizeRole("reader"), async (req, res) => {
   try {
     const { device_token, readings } = req.body;
     const device = await requireActiveDevice(device_token);
 
-    // Store user id as STRING (safe even if user_id is like "USR-1")
     const reader_id = String(getUserId(req) || "").trim();
     if (!reader_id) {
       return res.status(400).json({ error: "Invalid user token" });
@@ -203,7 +186,6 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
         });
       }
 
-      // SQL DATE expects YYYY-MM-DD
       const reading_date = String(r.lastread_date).slice(0, 10);
 
       await sequelize.query(
@@ -217,11 +199,11 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
         `,
         {
           replacements: {
-            device_id: device.id, // INT
-            reader_user_id: reader_id, // NVARCHAR
-            meter_id, // NVARCHAR
-            reading_value, // DECIMAL
-            reading_date, // DATE
+            device_id: device.id,
+            reader_user_id: reader_id,
+            meter_id,
+            reading_value,
+            reading_date,
             remarks: r.remarks || null,
             image: r.image || null,
           },
@@ -239,10 +221,9 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
   }
 });
 
-// ---------------- ADMIN: LIST PENDING ----------------
-// GET /offlineExport/pending
-
-router.get("/pending", authorizeRole("admin"), async (_req, res) => {
+// ---------------- APPROVER: LIST PENDING ----------------
+// ✅ allow admin/operator/biller to view pending if they have access
+router.get("/pending", authorizeRole("admin", "operator", "biller"), async (_req, res) => {
   try {
     const rows = await sequelize.query(
       `
@@ -274,16 +255,15 @@ router.get("/pending", authorizeRole("admin"), async (_req, res) => {
   }
 });
 
-// ---------------- ADMIN APPROVE ----------------
-// POST /offlineExport/approve/:id
-
-router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
+// ---------------- APPROVER: APPROVE ----------------
+// ✅ allow admin/operator/biller to approve if they have access
+router.post("/approve/:id", authorizeRole("admin", "operator", "biller"), async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    const admin_id = String(getUserId(req) || "").trim();
-    if (!admin_id) {
-      return res.status(400).json({ error: "Invalid admin token" });
+    const approver_id = String(getUserId(req) || "").trim();
+    if (!approver_id) {
+      return res.status(400).json({ error: "Invalid token" });
     }
 
     const rows = await sequelize.query(
@@ -316,7 +296,7 @@ router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
           reading_value: s.reading_value,
           read_by: s.reader_user_id,
           lastread_date: s.reading_date,
-          updated_by: admin_id,
+          updated_by: approver_id,
           remarks: s.remarks,
           image: s.image_base64,
         },
@@ -329,11 +309,11 @@ router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
       UPDATE dbo.offline_submissions
       SET status = 'approved',
           approved_at = GETDATE(),
-          approved_by = :admin
+          approved_by = :approver
       WHERE id = :id
       `,
       {
-        replacements: { id, admin: admin_id },
+        replacements: { id, approver: approver_id },
         type: QueryTypes.UPDATE,
       }
     );
@@ -345,16 +325,15 @@ router.post("/approve/:id", authorizeRole("admin"), async (req, res) => {
   }
 });
 
-// ---------------- ADMIN REJECT ----------------
-// POST /offlineExport/reject/:id
-
-router.post("/reject/:id", authorizeRole("admin"), async (req, res) => {
+// ---------------- APPROVER: REJECT ----------------
+// ✅ allow admin/operator/biller to reject if they have access
+router.post("/reject/:id", authorizeRole("admin", "operator", "biller"), async (req, res) => {
   try {
     const id = Number(req.params.id);
 
-    const admin_id = String(getUserId(req) || "").trim();
-    if (!admin_id) {
-      return res.status(400).json({ error: "Invalid admin token" });
+    const approver_id = String(getUserId(req) || "").trim();
+    if (!approver_id) {
+      return res.status(400).json({ error: "Invalid token" });
     }
 
     await sequelize.query(
@@ -362,17 +341,18 @@ router.post("/reject/:id", authorizeRole("admin"), async (req, res) => {
       UPDATE dbo.offline_submissions
       SET status = 'rejected',
           approved_at = GETDATE(),
-          approved_by = :admin
+          approved_by = :approver
       WHERE id = :id AND status = 'pending'
       `,
       {
-        replacements: { id, admin: admin_id },
+        replacements: { id, approver: approver_id },
         type: QueryTypes.UPDATE,
       }
     );
 
     res.json({ message: "Rejected" });
   } catch (err) {
+    console.error("reject error", err);
     res.status(500).json({ error: err.message });
   }
 });

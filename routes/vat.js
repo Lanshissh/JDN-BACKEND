@@ -6,6 +6,7 @@ const { Op } = require('sequelize');
 const getCurrentDateTime = require('../utils/getCurrentDateTime');
 const authenticateToken = require('../middleware/authenticateToken');
 const authorizeRole = require('../middleware/authorizeRole');
+const authorizeAccess = require('../middleware/authorizeAccess'); // ✅ NEW
 const { authorizeBuildingParam } = require('../middleware/authorizeBuilding');
 
 const Tenant = require('../models/Tenant');
@@ -13,6 +14,7 @@ const VAT = require('../models/VAT');
 
 // All routes require login (same concept as rates.js)
 router.use(authenticateToken);
+router.use(authorizeAccess('vat'));
 
 /** helper: coerce numeric VAT fields to DECIMAL(10,2) percent points */
 function coerceVatNumbers(obj) {
@@ -24,17 +26,11 @@ function coerceVatNumbers(obj) {
       if (!Number.isFinite(n) || n < 0) {
         return { ok: false, error: `${k} must be a non-negative number` };
       }
-      // round to 2 decimals (e.g., 12.00 for 12%)
       out[k] = Math.round(n * 100) / 100;
     }
   }
   return { ok: true, data: out };
 }
-
-/** =========================
- *  VAT CODE CATALOG (GLOBAL)
- *  =========================
- */
 
 /** GET /vat — list VAT codes (optional ?q= on code/description) */
 router.get('/', authorizeRole('admin', 'biller', 'operator'), async (req, res) => {
@@ -77,11 +73,9 @@ router.post('/', authorizeRole('admin', 'biller'), async (req, res) => {
       return res.status(400).json({ error: 'vat_code is required' });
     }
 
-    // coerce numbers (percent points)
     const coerced = coerceVatNumbers({ e_vat, w_vat, l_vat });
     if (!coerced.ok) return res.status(400).json({ error: coerced.error });
 
-    // Generate next VAT-<n> (cross-dialect; MSSQL-safe)
     const rows = await VAT.findAll({
       where: { tax_id: { [Op.like]: 'VAT-%' } },
       attributes: ['tax_id'],
@@ -114,7 +108,6 @@ router.post('/', authorizeRole('admin', 'biller'), async (req, res) => {
     res.status(500).json({ error: 'Server error' });
   }
 });
-
 
 /** PUT /vat/:tax_id — update a VAT code (admin & biller) */
 router.put('/:tax_id', authorizeRole('admin', 'biller'), async (req, res) => {
@@ -166,15 +159,10 @@ router.delete('/:tax_id', authorizeRole('admin', 'biller'), async (req, res) => 
   }
 });
 
-/** ===================================================
- *  REPORTING: TENANTS BY BUILDING WITH THEIR VAT CODE
- *  (Biller sees only their assigned building via middleware)
- *  ===================================================
- */
 router.get(
   '/buildings/:building_id/tenants',
   authorizeRole('admin', 'biller', 'operator'),
-  authorizeBuildingParam(), // non-admin must match :building_id
+  authorizeBuildingParam(),
   async (req, res) => {
     try {
       const tenants = await Tenant.findAll({
@@ -185,7 +173,7 @@ router.get(
             model: VAT,
             as: 'vat',
             attributes: ['vat_code', 'vat_description', 'e_vat', 'w_vat', 'l_vat'],
-            required: false, // show tenants even if vat_code is null or missing
+            required: false,
           },
         ],
         order: [['tenant_name', 'ASC']],

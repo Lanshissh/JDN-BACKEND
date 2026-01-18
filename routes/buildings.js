@@ -8,6 +8,7 @@ const Building = require('../models/Building');
 // Auth/middlewares
 const authenticateToken = require('../middleware/authenticateToken');
 const authorizeRole = require('../middleware/authorizeRole');
+const authorizeAccess = require('../middleware/authorizeAccess'); // ✅ NEW
 const {
   authorizeBuildingParam,
   attachBuildingScope,
@@ -106,6 +107,7 @@ router.use(authenticateToken);
  */
 router.get(
   '/',
+  authorizeAccess('buildings'), // ✅ NEW
   authorizeRole('admin', 'operator', 'biller', 'reader'),
   attachBuildingScope(),
   async (req, res) => {
@@ -130,6 +132,7 @@ router.get(
  */
 router.get(
   '/:id',
+  authorizeAccess('buildings'), // ✅ NEW
   authorizeRole('admin', 'operator', 'biller', 'reader'),
   // IMPORTANT: :id is the building_id param
   authorizeBuildingParam('params', 'id'),
@@ -153,6 +156,7 @@ router.get(
  */
 router.post(
   '/',
+  authorizeAccess('buildings'), // ✅ NEW (admin will pass automatically)
   authorizeRole('admin'),
   async (req, res) => {
     try {
@@ -217,6 +221,7 @@ router.post(
  */
 router.put(
   '/:id',
+  authorizeAccess('buildings'), // ✅ NEW
   authorizeRole('admin'),
   // IMPORTANT: :id is the building_id param
   authorizeBuildingParam('params', 'id'),
@@ -270,6 +275,7 @@ router.put(
  */
 router.get(
   "/:id/base-rates",
+  authorizeAccess('buildings'), // ✅ NEW
   authorizeRole("admin", "biller", "operator", "reader"),
   async (req, res) => {
     try {
@@ -334,6 +340,7 @@ router.get(
  */
 router.put(
   '/:id/base-rates',
+  authorizeAccess('buildings'), // ✅ NEW
   authorizeRole('admin', 'biller', 'operator'),
   // IMPORTANT: :id is the building_id param
   authorizeBuildingParam('params', 'id'),

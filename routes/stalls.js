@@ -4,6 +4,7 @@ const router = express.Router();
 const getCurrentDateTime = require('../utils/getCurrentDateTime');
 const authenticateToken = require('../middleware/authenticateToken');
 const authorizeRole = require('../middleware/authorizeRole');
+const authorizeAccess = require('../middleware/authorizeAccess'); // ✅ NEW
 const {
   authorizeBuildingParam,
   attachBuildingScope,
@@ -27,6 +28,7 @@ const ALLOWED_STATUS = new Set(['occupied', 'available', 'under maintenance']);
  * - operator: stalls in their assigned building only
  */
 router.get('/',
+  authorizeAccess('stalls'), // ✅ NEW
   authorizeRole('admin', 'operator', 'biller', 'reader'),
   attachBuildingScope(),
   async (req, res) => {
@@ -48,6 +50,7 @@ router.get('/',
  * - operator: only if stall.building_id === req.user.building_id
  */
 router.get('/:id',
+  authorizeAccess('stalls'), // ✅ NEW
   authorizeRole('admin', 'operator'),
   enforceRecordBuilding(async (req) => {
     const stall = await Stall.findOne({
@@ -78,6 +81,7 @@ router.get('/:id',
  * - if tenant_id is provided, tenant must exist AND belong to the same building
  */
 router.post('/',
+  authorizeAccess('stalls'), // ✅ NEW
   authorizeRole('admin', 'operator'),
   authorizeBuildingParam(),
   async (req, res) => {
@@ -158,6 +162,7 @@ router.post('/',
  * - tenant consistency: if setting tenant_id (and status ≠ 'available'), tenant must exist and be in the (final) building
  */
 router.put('/:id',
+  authorizeAccess('stalls'), // ✅ NEW
   authorizeRole('admin', 'operator'),
   enforceRecordBuilding(async (req) => {
     const s = await Stall.findOne({
@@ -241,6 +246,7 @@ router.put('/:id',
  * - blocks delete if meters still reference this stall
  */
 router.delete('/:id',
+  authorizeAccess('stalls'), // ✅ NEW
   authorizeRole('admin', 'operator'),
   enforceRecordBuilding(async (req) => {
     const s = await Stall.findOne({

@@ -1,10 +1,10 @@
-// routes/meters.js
 const express = require('express');
 const router = express.Router();
 
 const getCurrentDateTime = require('../utils/getCurrentDateTime');
 const authenticateToken = require('../middleware/authenticateToken');
 const authorizeRole = require('../middleware/authorizeRole');
+const authorizeAccess = require('../middleware/authorizeAccess');
 const {
   authorizeBuildingParam,
   attachBuildingScope,
@@ -16,7 +16,7 @@ const { Op } = require('sequelize');
 const Meter = require('../models/Meter');
 const Stall = require('../models/Stall');
 const Reading = require('../models/Reading');
-const Tenant = require('../models/Tenant'); // <-- NEW
+const Tenant = require('../models/Tenant');
 
 // All routes require a valid token
 router.use(authenticateToken);
@@ -34,6 +34,7 @@ const ALLOWED_STATUS = new Set(['active', 'inactive']);
  *   - tenant_sn (if present on Tenant)
  */
 router.get('/',
+  authorizeAccess('meters'), // ✅ NEW
   authorizeRole('admin', 'operator', 'biller', 'reader'),
   attachBuildingScope(),
   async (req, res) => {
@@ -151,6 +152,7 @@ router.get('/',
  * - operator: only if the meter’s stall belongs to their building
  */
 router.get('/:id',
+  authorizeAccess('meters'), // ✅ NEW
   authorizeRole('admin', 'operator'),
   enforceRecordBuilding(async (req) => {
     const meter = await Meter.findOne({
@@ -186,6 +188,7 @@ router.get('/:id',
  * - defaults meter_mult: water -> 93.00, others -> 1 (if not provided)
  */
 router.post('/',
+  authorizeAccess('meters'), // ✅ NEW
   authorizeRole('admin', 'operator'),
   authorizeBuildingParam(), // if body.building_id is sent, ensures it matches operator’s building (admin bypass)
   async (req, res) => {
@@ -267,6 +270,7 @@ router.post('/',
  */
 router.put(
   '/:id',
+  authorizeAccess('meters'), // ✅ NEW
   authorizeRole('admin', 'operator'),
   // Populate req.restrictToBuildingIds (null for admin, string[] for operators)
   attachBuildingScope(),
@@ -375,6 +379,7 @@ router.put(
  * - blocks delete if readings exist
  */
 router.delete('/:id',
+  authorizeAccess('meters'), // ✅ NEW
   authorizeRole('admin', 'operator'),
   async (req, res) => {
     const meterId = req.params.id;

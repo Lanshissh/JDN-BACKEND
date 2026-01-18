@@ -6,6 +6,7 @@ const router = express.Router();
 const getCurrentDateTime = require('../utils/getCurrentDateTime');
 const authenticateToken = require('../middleware/authenticateToken');
 const authorizeRole = require('../middleware/authorizeRole');
+const authorizeAccess = require('../middleware/authorizeAccess'); // ✅ NEW
 const {
   authorizeBuildingParam,
   attachBuildingScope,
@@ -77,6 +78,7 @@ function toBool(v, fallback = false) {
 router.get(
   '/',
   authenticateToken,
+  authorizeAccess('tenants'), // ✅ NEW
   authorizeRole('admin', 'operator', 'biller'),
   async (req, res) => {
     try {
@@ -145,6 +147,7 @@ router.get(
 router.get(
   '/:id',
   authenticateToken,
+  authorizeAccess('tenants'), // ✅ NEW
   authorizeRole('admin', 'operator', 'biller'),
   enforceRecordBuilding(async (req) => {
     const rec = await Tenant.findOne({ where: { tenant_id: req.params.id } });
@@ -172,6 +175,7 @@ router.get(
 router.post(
   '/',
   authenticateToken,
+  authorizeAccess('tenants'), // ✅ NEW
   authorizeRole('admin', 'biller'),
   authorizeBuildingParam('body', 'building_id'), // non-admin must match their building
   async (req, res) => {
@@ -242,6 +246,7 @@ router.post(
 router.put(
   '/:id',
   authenticateToken,
+  authorizeAccess('tenants'), // ✅ NEW
   authorizeRole('admin', 'operator', 'biller'),
   enforceRecordBuilding(async (req) => {
     const rec = await Tenant.findOne({ where: { tenant_id: req.params.id } });
@@ -277,7 +282,9 @@ router.put(
         tenant_status: tenant_status ?? tenant.tenant_status,
         vat_code: vat_code ?? tenant.vat_code,
         wt_code: wt_code ?? tenant.wt_code,
-        for_penalty: typeof for_penalty === 'undefined' ? tenant.for_penalty : toBool(for_penalty, tenant.for_penalty),
+        for_penalty: typeof for_penalty === 'undefined'
+          ? tenant.for_penalty
+          : toBool(for_penalty, tenant.for_penalty),
         building_id: req.body?.building_id ?? tenant.building_id,
         last_updated: getCurrentDateTime(),
         updated_by: req.user?.user_fullname || 'System Admin',
@@ -299,6 +306,7 @@ router.put(
 router.delete(
   '/:id',
   authenticateToken,
+  authorizeAccess('tenants'), // ✅ NEW
   authorizeRole('admin', 'operator', 'biller'),
   enforceRecordBuilding(async (req) => {
     const rec = await Tenant.findOne({ where: { tenant_id: req.params.id } });

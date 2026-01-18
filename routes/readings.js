@@ -8,6 +8,7 @@ const { Op } = require('sequelize');
 const getCurrentDateTime = require('../utils/getCurrentDateTime');
 const authenticateToken = require('../middleware/authenticateToken');
 const authorizeRole = require('../middleware/authorizeRole');
+const authorizeAccess = require('../middleware/authorizeAccess'); // ✅ NEW
 
 // Models
 const Reading = require('../models/Reading');
@@ -21,6 +22,7 @@ const Stall   = require('../models/Stall');
 
 // Auth guard for all routes
 router.use(authenticateToken);
+router.use(authorizeAccess('meter_readings')); // ✅ NEW
 
 // ---------------------------------------------------------------------------
 // Helpers
