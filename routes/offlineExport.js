@@ -24,13 +24,42 @@ function getUserId(req) {
   return req.user?.user_id || req.user?.id || null;
 }
 
-function generateReadingId() {
+/**
+ * Offline submissions used to generate "R-YYYYMMDD-XXXXXX".
+ * We KEEP this helper in case you still want a local/offline reference,
+ * but APPROVAL will now generate MR-### instead.
+ */
+function generateOfflineRefId() {
   return (
     "R-" +
     new Date().toISOString().slice(0, 10).replace(/-/g, "") +
     "-" +
     Math.random().toString(36).substring(2, 8).toUpperCase()
   );
+}
+
+/**
+ * ✅ Generate next MR-### safely (SQL Server) using locks inside a transaction.
+ * - Uses UPDLOCK + HOLDLOCK so concurrent approvals won't create same MR number.
+ * - Reads max numeric part from existing MR-* ids.
+ */
+async function getNextMrReadingId(t) {
+  const rows = await sequelize.query(
+    `
+    SELECT TOP 1 reading_id
+    FROM dbo.meter_reading WITH (UPDLOCK, HOLDLOCK)
+    WHERE reading_id LIKE 'MR-%'
+    ORDER BY TRY_CONVERT(INT, SUBSTRING(reading_id, 4, 50)) DESC
+    `,
+    { type: QueryTypes.SELECT, transaction: t }
+  );
+
+  const lastId = rows?.[0]?.reading_id ? String(rows[0].reading_id) : "";
+  const m = /^MR-(\d+)$/i.exec(lastId);
+  const lastNum = m ? Number(m[1]) : 0;
+  const nextNum = Number.isFinite(lastNum) ? lastNum + 1 : 1;
+
+  return `MR-${nextNum}`;
 }
 
 async function requireActiveDevice(device_token) {
@@ -223,10 +252,13 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
 
 // ---------------- APPROVER: LIST PENDING ----------------
 // ✅ allow admin/operator/biller to view pending if they have access
-router.get("/pending", authorizeRole("admin", "operator", "biller"), async (_req, res) => {
-  try {
-    const rows = await sequelize.query(
-      `
+router.get(
+  "/pending",
+  authorizeRole("admin", "operator", "biller"),
+  async (_req, res) => {
+    try {
+      const rows = await sequelize.query(
+        `
       SELECT
         os.id,
         os.device_id,
@@ -245,116 +277,155 @@ router.get("/pending", authorizeRole("admin", "operator", "biller"), async (_req
       WHERE os.status = 'pending'
       ORDER BY os.submitted_at DESC
       `,
-      { type: QueryTypes.SELECT }
-    );
+        { type: QueryTypes.SELECT }
+      );
 
-    return res.json({ submissions: rows });
-  } catch (err) {
-    console.error("offlineExport/pending error:", err);
-    return res.status(500).json({ error: "Server error" });
+      return res.json({ submissions: rows });
+    } catch (err) {
+      console.error("offlineExport/pending error:", err);
+      return res.status(500).json({ error: "Server error" });
+    }
   }
-});
+);
 
 // ---------------- APPROVER: APPROVE ----------------
 // ✅ allow admin/operator/biller to approve if they have access
-router.post("/approve/:id", authorizeRole("admin", "operator", "biller"), async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+router.post(
+  "/approve/:id",
+  authorizeRole("admin", "operator", "biller"),
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
 
-    const approver_id = String(getUserId(req) || "").trim();
-    if (!approver_id) {
-      return res.status(400).json({ error: "Invalid token" });
-    }
-
-    const rows = await sequelize.query(
-      `SELECT * FROM dbo.offline_submissions WHERE id = :id`,
-      { replacements: { id }, type: QueryTypes.SELECT }
-    );
-
-    if (!rows.length) return res.status(404).json({ error: "Not found" });
-
-    const s = rows[0];
-    if (s.status !== "pending") {
-      return res.status(400).json({ error: "Already processed" });
-    }
-
-    await sequelize.query(
-      `
-      INSERT INTO dbo.meter_reading
-        (reading_id, meter_id, reading_value, read_by,
-         lastread_date, last_updated, updated_by,
-         remarks, image)
-      VALUES
-        (:reading_id, :meter_id, :reading_value, :read_by,
-         :lastread_date, SYSDATETIMEOFFSET(), :updated_by,
-         :remarks, :image)
-      `,
-      {
-        replacements: {
-          reading_id: generateReadingId(),
-          meter_id: s.meter_id,
-          reading_value: s.reading_value,
-          read_by: s.reader_user_id,
-          lastread_date: s.reading_date,
-          updated_by: approver_id,
-          remarks: s.remarks,
-          image: s.image_base64,
-        },
-        type: QueryTypes.INSERT,
+      const approver_id = String(getUserId(req) || "").trim();
+      if (!approver_id) {
+        return res.status(400).json({ error: "Invalid token" });
       }
-    );
 
-    await sequelize.query(
-      `
-      UPDATE dbo.offline_submissions
-      SET status = 'approved',
-          approved_at = GETDATE(),
-          approved_by = :approver
-      WHERE id = :id
-      `,
-      {
-        replacements: { id, approver: approver_id },
-        type: QueryTypes.UPDATE,
-      }
-    );
+      // ✅ Transaction to prevent duplicate MR numbers during concurrent approvals
+      const result = await sequelize.transaction(async (t) => {
+        const rows = await sequelize.query(
+          `SELECT * FROM dbo.offline_submissions WITH (UPDLOCK, HOLDLOCK) WHERE id = :id`,
+          { replacements: { id }, type: QueryTypes.SELECT, transaction: t }
+        );
 
-    res.json({ message: "Approved and saved to meter_reading" });
-  } catch (err) {
-    console.error("approve error", err);
-    res.status(500).json({ error: err.message });
+        if (!rows.length) {
+          const e = new Error("Not found");
+          e.status = 404;
+          throw e;
+        }
+
+        const s = rows[0];
+        if (String(s.status).toLowerCase() !== "pending") {
+          const e = new Error("Already processed");
+          e.status = 400;
+          throw e;
+        }
+
+        // ✅ Generate MR-### instead of R-YYYY...
+        const nextMrId = await getNextMrReadingId(t);
+
+        // Optional: mark remarks clearly as offline-origin (keeps audit in existing schema)
+        const baseRemarks = s.remarks ? String(s.remarks) : "";
+        const offlineTag = "[OFFLINE]";
+        const remarks =
+          baseRemarks && baseRemarks.includes(offlineTag)
+            ? baseRemarks
+            : baseRemarks
+            ? `${baseRemarks} ${offlineTag}`
+            : offlineTag;
+
+        await sequelize.query(
+          `
+        INSERT INTO dbo.meter_reading
+          (reading_id, meter_id, reading_value, read_by,
+           lastread_date, last_updated, updated_by,
+           remarks, image)
+        VALUES
+          (:reading_id, :meter_id, :reading_value, :read_by,
+           :lastread_date, SYSDATETIMEOFFSET(), :updated_by,
+           :remarks, :image)
+        `,
+          {
+            replacements: {
+              reading_id: nextMrId,
+              meter_id: s.meter_id,
+              reading_value: s.reading_value,
+              read_by: s.reader_user_id,
+              lastread_date: s.reading_date,
+              updated_by: approver_id,
+              remarks,
+              image: s.image_base64,
+            },
+            type: QueryTypes.INSERT,
+            transaction: t,
+          }
+        );
+
+        await sequelize.query(
+          `
+        UPDATE dbo.offline_submissions
+        SET status = 'approved',
+            approved_at = GETDATE(),
+            approved_by = :approver
+        WHERE id = :id
+        `,
+          {
+            replacements: { id, approver: approver_id },
+            type: QueryTypes.UPDATE,
+            transaction: t,
+          }
+        );
+
+        return { reading_id: nextMrId };
+      });
+
+      // ✅ Return the created MR id so UI can show "MR-###" immediately
+      return res.json({
+        message: "Approved and saved to meter_reading",
+        reading_id: result.reading_id,
+      });
+    } catch (err) {
+      console.error("approve error", err);
+      res.status(err.status || 500).json({ error: err.message });
+    }
   }
-});
+);
 
 // ---------------- APPROVER: REJECT ----------------
 // ✅ allow admin/operator/biller to reject if they have access
-router.post("/reject/:id", authorizeRole("admin", "operator", "biller"), async (req, res) => {
-  try {
-    const id = Number(req.params.id);
+router.post(
+  "/reject/:id",
+  authorizeRole("admin", "operator", "biller"),
+  async (req, res) => {
+    try {
+      const id = Number(req.params.id);
 
-    const approver_id = String(getUserId(req) || "").trim();
-    if (!approver_id) {
-      return res.status(400).json({ error: "Invalid token" });
-    }
+      const approver_id = String(getUserId(req) || "").trim();
+      if (!approver_id) {
+        return res.status(400).json({ error: "Invalid token" });
+      }
 
-    await sequelize.query(
-      `
+      await sequelize.query(
+        `
       UPDATE dbo.offline_submissions
       SET status = 'rejected',
           approved_at = GETDATE(),
           approved_by = :approver
       WHERE id = :id AND status = 'pending'
       `,
-      {
-        replacements: { id, approver: approver_id },
-        type: QueryTypes.UPDATE,
-      }
-    );
+        {
+          replacements: { id, approver: approver_id },
+          type: QueryTypes.UPDATE,
+        }
+      );
 
-    res.json({ message: "Rejected" });
-  } catch (err) {
-    console.error("reject error", err);
-    res.status(500).json({ error: err.message });
+      res.json({ message: "Rejected" });
+    } catch (err) {
+      console.error("reject error", err);
+      res.status(500).json({ error: err.message });
+    }
   }
-});
+);
 
 module.exports = router;
