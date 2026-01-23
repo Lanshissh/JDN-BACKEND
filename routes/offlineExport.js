@@ -25,6 +25,56 @@ function getUserId(req) {
 }
 
 /**
+ * Extract building scope from JWT payload.
+ * Supports:
+ * - building_ids: ["B1","B2"]
+ * - building_id: "B1"
+ */
+function getUserBuildingIds(req) {
+  const u = req.user || {};
+  const raw =
+    u.building_ids ??
+    u.buildings ??
+    u.buildingIds ??
+    (u.building_id ? [u.building_id] : []);
+
+  let arr = [];
+  if (Array.isArray(raw)) arr = raw;
+  else if (typeof raw === "string" && raw.trim()) {
+    // allow JSON string or csv
+    const s = raw.trim();
+    try {
+      const parsed = JSON.parse(s);
+      arr = Array.isArray(parsed) ? parsed : [parsed];
+    } catch {
+      arr = s.split(",").map((x) => x.trim());
+    }
+  } else if (raw != null) {
+    arr = [raw];
+  }
+
+  // normalize to trimmed strings
+  return arr
+    .map((x) => String(x ?? "").trim())
+    .filter(Boolean);
+}
+
+/**
+ * Build a safe IN-clause with named replacements:
+ *  buildInClause("B", ["A","C"])
+ *   -> { clause: ":B0,:B1", replacements: { B0:"A", B1:"C" } }
+ */
+function buildInClause(prefix, values) {
+  const reps = {};
+  const keys = values.map((v, i) => {
+    const k = `${prefix}${i}`;
+    reps[k] = v;
+    return `:${k}`;
+  });
+  return { clause: keys.join(", "), replacements: reps };
+}
+
+/**
  * Offline submissions used to generate "R-YYYYMMDD-XXXXXX".
  * We KEEP this helper in case you still want a local/offline reference,
  * but APPROVAL will now generate MR-### instead.
@@ -94,12 +144,28 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
     const { device_token } = req.body;
     const device = await requireActiveDevice(device_token);
 
+    // ✅ Scope meters by the reader's assigned building_ids from JWT
+    const buildingIds = getUserBuildingIds(req);
+
+    // Build optional WHERE clause
+    let whereSql = "";
+    let whereReps = {};
+
+    if (buildingIds.length > 0) {
+      const { clause, replacements } = buildInClause("b", buildingIds);
+      // only include meters whose stall belongs to allowed buildings
+      whereSql = `WHERE s.building_id IN (${clause})`;
+      whereReps = replacements;
+    }
+    // If buildingIds is empty, we DO NOT filter (fallback behavior)
+
     const items = await sequelize.query(
       `
       SELECT
         m.meter_id,
         m.stall_id,
         m.meter_sn,
+        s.building_id,
 
         CASE
           WHEN LOWER(m.meter_type) LIKE '%electric%' OR LOWER(m.meter_type) LIKE '%power%' THEN 'electric'
@@ -140,9 +206,16 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
         ORDER BY lastread_date DESC
       ) lr2
 
+      ${whereSql}
+
       ORDER BY m.meter_id ASC
       `,
-      { type: QueryTypes.SELECT }
+      {
+        type: QueryTypes.SELECT,
+        replacements: {
+          ...whereReps,
+        },
+      }
     );
 
     return res.json({
@@ -150,9 +223,13 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
         generated_at: new Date().toISOString(),
         device_serial: device.device_serial || null,
         device_name: device.device_name || null,
+        scope: {
+          building_ids: buildingIds,
+        },
         items: (items || []).map((x) => ({
           meter_id: x.meter_id,
           stall_id: x.stall_id ?? null,
+          building_id: x.building_id ?? null, // ✅ NEW (helps client filtering)
           meter_number: x.meter_sn ?? null,
           tenant_name: x.tenant_name ?? null,
           classification: x.classification ?? null,
