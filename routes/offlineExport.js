@@ -1,19 +1,12 @@
-// routes/offlineExport.js
-// Offline IMPORT / EXPORT for Reader devices
-
 const express = require("express");
 const { QueryTypes } = require("sequelize");
-
 const authenticateToken = require("../middleware/authenticateToken");
 const authorizeRole = require("../middleware/authorizeRole");
 const authorizeAccess = require("../middleware/authorizeAccess");
 const sequelize = require("../models");
-
 const router = express.Router();
-
 router.use(authenticateToken);
 
-// ✅ Allow either permission:
 // - readers need meter_readings to import/export
 // - approvers may have offline_submissions (UI) which implies meter_readings (users.js fix)
 router.use(authorizeAccess(["meter_readings", "offline_submissions"]));
@@ -89,7 +82,6 @@ function generateOfflineRefId() {
 }
 
 /**
- * ✅ Generate next MR-### safely (SQL Server) using locks inside a transaction.
  * - Uses UPDLOCK + HOLDLOCK so concurrent approvals won't create same MR number.
  * - Reads max numeric part from existing MR-* ids.
  */
@@ -138,26 +130,45 @@ async function requireActiveDevice(device_token) {
 }
 
 // ---------------- READER IMPORT ----------------
-// POST /offlineExport/import { device_token }
 router.post("/import", authorizeRole("reader"), async (req, res) => {
   try {
     const { device_token } = req.body;
     const device = await requireActiveDevice(device_token);
 
-    // ✅ Scope meters by the reader's assigned building_ids from JWT
     const buildingIds = getUserBuildingIds(req);
 
-    // Build optional WHERE clause
-    let whereSql = "";
+    // ✅ Build WHERE conditions safely (so we can add "exclude today done" filters)
+    const whereParts = [];
     let whereReps = {};
 
     if (buildingIds.length > 0) {
       const { clause, replacements } = buildInClause("b", buildingIds);
-      // only include meters whose stall belongs to allowed buildings
-      whereSql = `WHERE s.building_id IN (${clause})`;
-      whereReps = replacements;
+      whereParts.push(`s.building_id IN (${clause})`);
+      whereReps = { ...whereReps, ...replacements };
     }
-    // If buildingIds is empty, we DO NOT filter (fallback behavior)
+
+    // ✅ IMPORTANT: exclude meters already DONE TODAY (online) OR pending TODAY (offline submissions)
+    // This prevents importing MTR-1 again for today while it is pending/approved for today.
+    whereParts.push(`
+      NOT EXISTS (
+        SELECT 1
+        FROM dbo.meter_reading mr
+        WHERE mr.meter_id = m.meter_id
+          AND CONVERT(date, mr.lastread_date) = CONVERT(date, GETDATE())
+      )
+    `);
+
+    whereParts.push(`
+      NOT EXISTS (
+        SELECT 1
+        FROM dbo.offline_submissions os
+        WHERE os.meter_id = m.meter_id
+          AND os.status = 'pending'
+          AND CONVERT(date, os.reading_date) = CONVERT(date, GETDATE())
+      )
+    `);
+
+    const whereSql = whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "";
 
     const items = await sequelize.query(
       `
@@ -229,7 +240,7 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
         items: (items || []).map((x) => ({
           meter_id: x.meter_id,
           stall_id: x.stall_id ?? null,
-          building_id: x.building_id ?? null, // ✅ NEW (helps client filtering)
+          building_id: x.building_id ?? null,
           meter_number: x.meter_sn ?? null,
           tenant_name: x.tenant_name ?? null,
           classification: x.classification ?? null,
@@ -253,7 +264,6 @@ router.post("/import", authorizeRole("reader"), async (req, res) => {
 });
 
 // ---------------- READER EXPORT ----------------
-// POST /offlineExport/export { device_token, readings: [...] }
 router.post("/export", authorizeRole("reader"), async (req, res) => {
   try {
     const { device_token, readings } = req.body;
@@ -328,7 +338,6 @@ router.post("/export", authorizeRole("reader"), async (req, res) => {
 });
 
 // ---------------- APPROVER: LIST PENDING ----------------
-// ✅ allow admin/operator/biller to view pending if they have access
 router.get(
   "/pending",
   authorizeRole("admin", "operator", "biller"),
@@ -366,7 +375,6 @@ router.get(
 );
 
 // ---------------- APPROVER: APPROVE ----------------
-// ✅ allow admin/operator/biller to approve if they have access
 router.post(
   "/approve/:id",
   authorizeRole("admin", "operator", "biller"),
@@ -379,7 +387,6 @@ router.post(
         return res.status(400).json({ error: "Invalid token" });
       }
 
-      // ✅ Transaction to prevent duplicate MR numbers during concurrent approvals
       const result = await sequelize.transaction(async (t) => {
         const rows = await sequelize.query(
           `SELECT * FROM dbo.offline_submissions WITH (UPDLOCK, HOLDLOCK) WHERE id = :id`,
@@ -399,10 +406,8 @@ router.post(
           throw e;
         }
 
-        // ✅ Generate MR-### instead of R-YYYY...
         const nextMrId = await getNextMrReadingId(t);
 
-        // Optional: mark remarks clearly as offline-origin (keeps audit in existing schema)
         const baseRemarks = s.remarks ? String(s.remarks) : "";
         const offlineTag = "[OFFLINE]";
         const remarks =
@@ -457,7 +462,6 @@ router.post(
         return { reading_id: nextMrId };
       });
 
-      // ✅ Return the created MR id so UI can show "MR-###" immediately
       return res.json({
         message: "Approved and saved to meter_reading",
         reading_id: result.reading_id,
@@ -470,7 +474,6 @@ router.post(
 );
 
 // ---------------- APPROVER: REJECT ----------------
-// ✅ allow admin/operator/biller to reject if they have access
 router.post(
   "/reject/:id",
   authorizeRole("admin", "operator", "biller"),
